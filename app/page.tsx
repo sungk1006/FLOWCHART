@@ -2,12 +2,68 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-import {
-  buildDueReminderProcessRequest,
-  type DueReminderJobResult,
-  type DueReminderProcessResponse,
-} from "@/lib/due-reminder-email";
-import type { MentionNotifyResponse } from "@/lib/mention-email";
+type DueReminderJobResult = {
+  ok: boolean;
+  projectId: string;
+  phaseId: string;
+  stepId: string;
+  sentAt?: string;
+  error?: string;
+};
+
+type DueReminderProcessResponse = {
+  ok: boolean;
+  mock: boolean;
+  processed?: DueReminderJobResult[];
+  error?: string;
+};
+
+type MentionNotifyResult = {
+  email: string;
+  name: string;
+  ok: boolean;
+  error?: string;
+};
+
+type MentionNotifyResponse = {
+  ok: boolean;
+  mock: boolean;
+  results: MentionNotifyResult[];
+  error?: string;
+};
+
+type DueReminderRequestProject = {
+  id: string;
+  code: string;
+  phases: {
+    id: string;
+    title: string;
+    steps: {
+      id: string;
+      label: string;
+      checked: boolean;
+      dueDate: string;
+      assigneeMemberId: string;
+      dueReminderSentAt: string;
+    }[];
+  }[];
+};
+
+type DueReminderRequestMember = {
+  id: string;
+  name: string;
+  email: string;
+};
+
+function buildDueReminderProcessRequest(
+  projects: DueReminderRequestProject[],
+  members: DueReminderRequestMember[]
+) {
+  return {
+    projects,
+    members,
+  };
+}
 
 type ProjectStatus = "REVIEW" | "IN PROGRESS" | "HOLD" | "DONE" | "DRAFT";
 type SortOption = "UPDATED_DESC" | "CODE_ASC" | "CODE_DESC" | "PROGRESS_DESC";
