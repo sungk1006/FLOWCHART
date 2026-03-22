@@ -1,4 +1,5 @@
 export const runtime = 'edge';
+
 import { NextResponse } from "next/server";
 
 import { isEmailMockMode } from "@/lib/email-mode";
@@ -9,8 +10,6 @@ import {
   type MentionNotifyRecipientResult,
 } from "@/lib/mention-email";
 import { sendFlowchartEmail } from "@/lib/send-email";
-
-export const runtime = "nodejs";
 
 export async function POST(req: Request) {
   console.log("[app/api/notify-mention/route.ts] POST — Save Comment 멘션 알림이 이 핸들러를 호출합니다.");
