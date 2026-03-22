@@ -1,4 +1,5 @@
 export const runtime = 'edge';
+
 import { NextResponse } from "next/server";
 
 import {
@@ -11,8 +12,6 @@ import {
 } from "@/lib/due-reminder-email";
 import { isEmailMockMode } from "@/lib/email-mode";
 import { sendFlowchartEmail } from "@/lib/send-email";
-
-export const runtime = "nodejs";
 
 export async function POST(req: Request) {
   console.log("[app/api/due-reminders/route.ts] POST — Due 24h 알림 검사(API) 버튼이 이 핸들러를 호출합니다.");
