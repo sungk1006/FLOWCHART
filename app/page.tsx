@@ -1211,7 +1211,7 @@ export default function Page() {
         <aside className="sticky top-4 h-[calc(100vh-2rem)] w-[340px] shrink-0 overflow-hidden rounded-[28px] border border-neutral-200 bg-white">
           <div className="border-b border-neutral-200 px-5 py-5">
             <div className="mb-1 text-[11px] uppercase tracking-[0.22em] text-neutral-500">Dashboard</div>
-            <div className="text-[30px] font-black tracking-[-0.05em]">FLOWCHART</div>
+            <div className="text-[30px] font-black tracking-[-0.05em]">FLOWCHART TEST</div>
             <div className="mt-2 text-sm text-neutral-500">코드 중심 리스트 + 고정 15단계 플로우</div>
           </div>
 
