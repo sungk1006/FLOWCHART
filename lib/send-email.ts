@@ -22,21 +22,35 @@ function getResendApiKey(): string | undefined {
   return v || undefined;
 }
 
+/** 원래 수신자(intended)와 실제 발송 대상(delivery). TEST_EMAIL이 있으면 delivery만 오버라이드. */
+function resolveEmailDelivery(intendedTo: string): {
+  intendedTo: string;
+  deliveryTo: string;
+} {
+  const intended = intendedTo.trim();
+  const test = process.env.TEST_EMAIL?.trim();
+  if (test && test.length > 0) {
+    return { intendedTo: intended, deliveryTo: test };
+  }
+  return { intendedTo: intended, deliveryTo: intended };
+}
+
 export async function sendFlowchartEmail(options: {
   to: string;
   subject: string;
   text: string;
   kind: FlowchartEmailKind;
 }): Promise<SendFlowchartEmailResult> {
-  const to = options.to.trim();
-  if (!to) {
+  const { intendedTo, deliveryTo } = resolveEmailDelivery(options.to);
+  if (!intendedTo) {
     return { ok: false, mock: isEmailMockMode(), error: "empty recipient" };
   }
 
   if (isEmailMockMode()) {
     console.log(`[lib/send-email.ts][mock] ${FLOWCHART_SEND_EMAIL_BUILD_ID}`);
     console.log(`[FLOWCHART email:mock][${options.kind}]`);
-    console.log("  to:", to);
+    console.log("  intended recipient:", intendedTo);
+    console.log("  delivery recipient (actual send):", deliveryTo);
     console.log("  from:", getFromAddress() ?? "(EMAIL_FROM - mock에서는 미사용)");
     console.log("  subject:", options.subject);
     console.log("  body:\n" + options.text);
@@ -54,6 +68,10 @@ export async function sendFlowchartEmail(options: {
     return { ok: false, mock: false, error: "RESEND_API_KEY is not set" };
   }
 
+  console.log(
+    `[lib/send-email.ts][live][${options.kind}] intended recipient: ${intendedTo} → delivery recipient: ${deliveryTo}`
+  );
+
   try {
     const response = await fetch("https://api.resend.com/emails", {
       method: "POST",
@@ -63,7 +81,7 @@ export async function sendFlowchartEmail(options: {
       },
       body: JSON.stringify({
         from,
-        to: [to],
+        to: [deliveryTo],
         subject: options.subject,
         text: options.text,
       }),
