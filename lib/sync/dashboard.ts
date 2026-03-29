@@ -135,6 +135,24 @@ export async function loadDashboard(): Promise<{
   return { projects, members };
 }
 
+/** 멤버는 클라이언트 localStorage 전용일 때 프로젝트만 로드 */
+export async function loadProjectsOnly(): Promise<{ projects: ProjectRow[] }> {
+  const sb = getSupabaseBrowserClient();
+
+  if (!process.env.NEXT_PUBLIC_FLOWCHART_SHARE_ID?.trim()) {
+    throw new Error("NEXT_PUBLIC_FLOWCHART_SHARE_ID is not set");
+  }
+
+  const pmRes = await sb
+    .from("projects")
+    .select("*")
+    .eq("share_id", process.env.NEXT_PUBLIC_FLOWCHART_SHARE_ID!.trim());
+
+  if (pmRes.error) throw pmRes.error;
+
+  return { projects: (pmRes.data ?? []) as ProjectRow[] };
+}
+
 export async function upsertProject(p: ProjectSyncInput): Promise<void> {
   const sb = getSupabaseBrowserClient();
   const shareId = boardShareIdOrThrow();
@@ -213,5 +231,9 @@ export async function syncProjects(projects: ProjectSyncInput[]): Promise<void> 
 
 export async function syncDashboard(projects: ProjectSyncInput[], members: MemberSyncInput[]): Promise<void> {
   await replaceMembers(members);
+  await syncProjects(projects);
+}
+
+export async function syncProjectsOnly(projects: ProjectSyncInput[]): Promise<void> {
   await syncProjects(projects);
 }
