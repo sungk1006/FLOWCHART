@@ -23,19 +23,33 @@ function LoginForm() {
     setLoading(true);
     setMessage(null);
     const supabase = getSupabaseBrowserClient();
+    const emailTrimmed = email.trim();
     try {
       if (mode === "signup") {
         const { error } = await supabase.auth.signUp({
-          email: email.trim(),
+          email: emailTrimmed,
           password,
           options: { emailRedirectTo: `${window.location.origin}/auth/callback` },
         });
         if (error) throw error;
-        setMessage("가입 확인 메일이 오면 링크를 눌러 주세요. 이메일 확인을 끄면 바로 로그인됩니다.");
+
+        const { error: signInError } = await supabase.auth.signInWithPassword({
+          email: emailTrimmed,
+          password,
+        });
+        if (signInError) {
+          setMessage(
+            "가입 확인 메일이 오면 링크를 눌러 주세요. 이메일 확인을 끄면 바로 로그인됩니다."
+          );
+          router.refresh();
+          return;
+        }
+        const next = searchParams.get("next") ?? "/";
+        router.push(next.startsWith("/") ? next : "/");
         router.refresh();
       } else {
         const { error } = await supabase.auth.signInWithPassword({
-          email: email.trim(),
+          email: emailTrimmed,
           password,
         });
         if (error) throw error;
