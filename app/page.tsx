@@ -648,7 +648,7 @@ export default function Page() {
 
   const [globalMembers, setGlobalMembers] = useState<Member[]>([]);
   const [authUserId, setAuthUserId] = useState<string | null>(null);
-  const [memberPanelOpen, setMemberPanelOpen] = useState(false);
+  const [memberPanelOpen, setMemberPanelOpen] = useState(true);
 
   const [panelOpen, setPanelOpen] = useState(false);
   const [filterOpen, setFilterOpen] = useState(false);
@@ -694,8 +694,9 @@ export default function Page() {
       const data = await loadDashboard();
       if (cancelled) return;
 
-      console.log("[DEBUG] loadDashboard raw members", data.members);
-      const beforeNormalize = data.members.map((row) => rowToMember(row));
+      const serverMembers = Array.isArray(data.members) ? data.members : [];
+      console.log("[DEBUG] loadDashboard raw members", serverMembers);
+      const beforeNormalize = serverMembers.map((row) => rowToMember(row));
       console.log("[DEBUG] before normalize", beforeNormalize);
       const members = normalizeStoredMembers(beforeNormalize);
       console.log("[DEBUG] after normalize", members);
@@ -878,19 +879,22 @@ export default function Page() {
       console.log("[flowchart] loadDashboard start", { shareId: shareIdLocked });
       try {
         const data = await loadDashboard();
+        const serverMemberRows = Array.isArray(data.members) ? data.members : [];
         console.log("[flowchart] loadDashboard finish", {
           shareId: shareIdLocked,
-          memberRows: data.members.length,
+          memberRows: serverMemberRows.length,
           projectRows: data.projects.length,
         });
 
-        const members = normalizeStoredMembers(data.members.map((row) => rowToMember(row)));
+        const members = normalizeStoredMembers(serverMemberRows.map((row) => rowToMember(row)));
         const memberIds = new Set(members.map((m) => m.id));
         const restored = normalizeStoredProjects(
           data.projects.map((row) => projectFromStorage(rowToProject(row as ProjectRow)))
         );
         const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
         const finalProjects = next.length > 0 ? next : initialProjects;
+
+        setGlobalMembers(members);
 
         const fp = dashboardDataFingerprint(members, finalProjects);
         const fpSame = fp === lastRemoteFingerprintRef.current;
@@ -913,7 +917,6 @@ export default function Page() {
           projects: finalProjects.length,
         });
 
-        setGlobalMembers(members);
         setProjects(finalProjects);
         setSelectedId((prev) => {
           const ids = new Set(finalProjects.map((p) => p.id));
@@ -1632,40 +1635,12 @@ export default function Page() {
 
             {memberPanelOpen && (
               <div className="relative z-0 mb-3 rounded-[22px] border border-neutral-200 bg-[#f8f7f5]">
-                <div className="border-b border-neutral-200 px-3 py-3 text-sm font-semibold">Global Members</div>
+                <div className="flex items-center justify-between border-b border-neutral-200 px-3 py-3">
+                  <div className="text-sm font-semibold">Global Members</div>
+                  <div className="text-xs text-neutral-500">{globalMembers.length}명</div>
+                </div>
 
-                <div className="max-h-[38vh] space-y-3 overflow-y-auto p-3">
-                  <Field label="NAME">
-                    <Input
-                      value={memberForm.name}
-                      onChange={(v) => updateMemberFormField("name", v)}
-                      placeholder="멤버 이름"
-                    />
-                  </Field>
-
-                  <Field label="EMAIL">
-                    <Input
-                      value={memberForm.email}
-                      onChange={(v) => updateMemberFormField("email", v)}
-                      placeholder="example@email.com"
-                    />
-                  </Field>
-
-                  <Field label="ROLE">
-                    <Select
-                      value={memberForm.role}
-                      onChange={(v) => updateMemberFormField("role", v as MemberRole)}
-                      options={["관리자", "사용자"]}
-                    />
-                  </Field>
-
-                  <button
-                    onClick={addGlobalMember}
-                    className="w-full rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white"
-                  >
-                    + Add Member
-                  </button>
-
+                <div className="max-h-[min(55vh,36rem)] space-y-4 overflow-y-auto p-3">
                   <div className="space-y-2">
                     {globalMembers.length === 0 ? (
                       <div className="rounded-2xl border border-dashed border-neutral-200 bg-white px-4 py-5 text-center text-sm text-neutral-400">
@@ -1708,6 +1683,41 @@ export default function Page() {
                         </div>
                       ))
                     )}
+                  </div>
+
+                  <div className="space-y-3 border-t border-neutral-200 pt-3">
+                    <div className="text-[11px] font-medium uppercase tracking-wide text-neutral-500">멤버 추가</div>
+                    <Field label="NAME">
+                      <Input
+                        value={memberForm.name}
+                        onChange={(v) => updateMemberFormField("name", v)}
+                        placeholder="멤버 이름"
+                      />
+                    </Field>
+
+                    <Field label="EMAIL">
+                      <Input
+                        value={memberForm.email}
+                        onChange={(v) => updateMemberFormField("email", v)}
+                        placeholder="example@email.com"
+                      />
+                    </Field>
+
+                    <Field label="ROLE">
+                      <Select
+                        value={memberForm.role}
+                        onChange={(v) => updateMemberFormField("role", v as MemberRole)}
+                        options={["관리자", "사용자"]}
+                      />
+                    </Field>
+
+                    <button
+                      type="button"
+                      onClick={addGlobalMember}
+                      className="w-full rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white"
+                    >
+                      + Add Member
+                    </button>
                   </div>
                 </div>
               </div>

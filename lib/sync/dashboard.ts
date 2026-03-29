@@ -133,10 +133,8 @@ export async function loadDashboard(): Promise<{
     user_id: parseMemberUserIdColumn(r.user_id),
   }));
 
-  return {
-    projects: (pmRes.data ?? []) as ProjectRow[],
-    members,
-  };
+  const projects = (pmRes.data ?? []) as ProjectRow[];
+  return { projects, members };
 }
 
 export async function upsertProject(p: ProjectSyncInput): Promise<void> {
