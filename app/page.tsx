@@ -686,12 +686,12 @@ export default function Page() {
     let cancelled = false;
     const sb = getSupabaseBrowserClient();
 
-    async function applyDashboardFromRemote(shareId: string) {
-      const ensured = await ensureBoardMemberForCurrentUser(shareId);
+    async function applyDashboardFromRemote() {
+      const ensured = await ensureBoardMemberForCurrentUser();
       if (!ensured.ok) {
         console.error("[flowchart] ensureBoardMemberForCurrentUser failed", ensured);
       }
-      const data = await loadDashboard(shareId);
+      const data = await loadDashboard();
       if (cancelled) return;
 
       console.log("[DEBUG] loadDashboard raw members", data.members);
@@ -731,10 +731,9 @@ export default function Page() {
       if (cancelled) return;
       setAuthUserId(session?.user?.id ?? null);
       if (!isSupabaseDashboardEnabled() || !session?.user) return;
-      const shareIdFromAuth = getFlowchartShareId()?.trim();
-      if (!shareIdFromAuth) return;
+      if (!getFlowchartShareId()) return;
       try {
-        await applyDashboardFromRemote(shareIdFromAuth);
+        await applyDashboardFromRemote();
       } catch (e) {
         console.error("[flowchart] loadDashboard failed", e);
       }
@@ -754,7 +753,7 @@ export default function Page() {
           return;
         }
         try {
-          await applyDashboardFromRemote(shareId);
+          await applyDashboardFromRemote();
         } catch (e) {
           console.error("[flowchart] loadDashboard failed", e);
         } finally {
@@ -831,13 +830,12 @@ export default function Page() {
 
   useEffect(() => {
     if (!isSupabaseDashboardEnabled() || !storageReady) return;
-    const shareId = getFlowchartShareId();
-    if (!shareId) return;
+    if (!getFlowchartShareId()) return;
 
     if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
     syncTimerRef.current = setTimeout(() => {
       syncTimerRef.current = null;
-      void syncDashboard(shareId, projects, globalMembers).catch((e) => {
+      void syncDashboard(projects, globalMembers).catch((e) => {
         console.error("[flowchart] syncDashboard failed", e);
       });
     }, 800);
@@ -879,7 +877,7 @@ export default function Page() {
     async function applyRemoteDashboard() {
       console.log("[flowchart] loadDashboard start", { shareId: shareIdLocked });
       try {
-        const data = await loadDashboard(shareIdLocked);
+        const data = await loadDashboard();
         console.log("[flowchart] loadDashboard finish", {
           shareId: shareIdLocked,
           memberRows: data.members.length,
@@ -958,7 +956,7 @@ export default function Page() {
     const useServerFilter = SHARE_ID_UUID_RE.test(shareIdLocked);
     if (!useServerFilter) {
       console.warn(
-        "[flowchart] realtime: shareId is not a UUID string. DB column share_id is uuid — use `?shareId=<uuid>` (same as NEXT_PUBLIC_FLOWCHART_SHARE_ID) or Realtime filter `share_id=eq....` will not match rows; sync writes may also fail."
+        "[flowchart] realtime: NEXT_PUBLIC_FLOWCHART_SHARE_ID must be a UUID string. DB column share_id is uuid — Realtime filter `share_id=eq....` and sync may fail otherwise."
       );
     }
 

@@ -8,12 +8,20 @@ export type EnsureBoardMemberResult =
 
 /**
  * 현재 세션 사용자가 해당 share 보드에 members 행이 없으면 생성합니다.
+ * 보드는 `NEXT_PUBLIC_FLOWCHART_SHARE_ID`와 동일한 share_id만 사용합니다.
  * 이미 (share_id, user_id) 조합이 있으면 아무 것도 하지 않습니다.
  * 같은 이메일의 수동 멤버가 있으면 해당 row에 user_id를 연결합니다.
  */
-export async function ensureBoardMemberForCurrentUser(
-  shareId: string
-): Promise<EnsureBoardMemberResult> {
+export async function ensureBoardMemberForCurrentUser(): Promise<EnsureBoardMemberResult> {
+  const shareId = process.env.NEXT_PUBLIC_FLOWCHART_SHARE_ID?.trim();
+  if (!shareId) {
+    return {
+      ok: false,
+      reason: "db_error",
+      message: "NEXT_PUBLIC_FLOWCHART_SHARE_ID is not set",
+    };
+  }
+
   const supabase = await createSupabaseServerClient();
 
   const {

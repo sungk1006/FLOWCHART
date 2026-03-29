@@ -1,5 +1,11 @@
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 
+function boardShareIdOrThrow(): string {
+  const id = process.env.NEXT_PUBLIC_FLOWCHART_SHARE_ID?.trim();
+  if (!id) throw new Error("NEXT_PUBLIC_FLOWCHART_SHARE_ID is not set");
+  return id;
+}
+
 /** DB 컬럼 id는 createId 문자열도 허용하도록 text PK 전제 */
 export type ProjectRow = {
   id: string;
@@ -97,15 +103,19 @@ export function rowToMember(row: MemberRow): MemberSyncInput {
   };
 }
 
-export async function loadDashboard(shareId: string): Promise<{
+export async function loadDashboard(): Promise<{
   projects: ProjectRow[];
   members: MemberRow[];
 }> {
   const sb = getSupabaseBrowserClient();
 
+  if (!process.env.NEXT_PUBLIC_FLOWCHART_SHARE_ID?.trim()) {
+    throw new Error("NEXT_PUBLIC_FLOWCHART_SHARE_ID is not set");
+  }
+
   const [pmRes, mbRes] = await Promise.all([
-    sb.from("projects").select("*").eq("share_id", shareId),
-    sb.from("members").select("*").eq("share_id", shareId),
+    sb.from("projects").select("*").eq("share_id", process.env.NEXT_PUBLIC_FLOWCHART_SHARE_ID!.trim()),
+    sb.from("members").select("*").eq("share_id", process.env.NEXT_PUBLIC_FLOWCHART_SHARE_ID!.trim()),
   ]);
 
   if (pmRes.error) throw pmRes.error;
@@ -129,28 +139,32 @@ export async function loadDashboard(shareId: string): Promise<{
   };
 }
 
-export async function upsertProject(shareId: string, p: ProjectSyncInput): Promise<void> {
+export async function upsertProject(p: ProjectSyncInput): Promise<void> {
   const sb = getSupabaseBrowserClient();
+  const shareId = boardShareIdOrThrow();
   const row = projectToRow(shareId, p);
   const { error } = await sb.from("projects").upsert(row, { onConflict: "id" });
   if (error) throw error;
 }
 
-export async function deleteProject(shareId: string, projectId: string): Promise<void> {
+export async function deleteProject(projectId: string): Promise<void> {
   const sb = getSupabaseBrowserClient();
+  const shareId = boardShareIdOrThrow();
   const { error } = await sb.from("projects").delete().eq("id", projectId).eq("share_id", shareId);
   if (error) throw error;
 }
 
-export async function upsertMember(shareId: string, m: MemberSyncInput): Promise<void> {
+export async function upsertMember(m: MemberSyncInput): Promise<void> {
   const sb = getSupabaseBrowserClient();
+  const shareId = boardShareIdOrThrow();
   const row = memberToRow(shareId, m);
   const { error } = await sb.from("members").upsert(row as never, { onConflict: "id" });
   if (error) throw error;
 }
 
-export async function deleteMember(shareId: string, memberId: string): Promise<void> {
+export async function deleteMember(memberId: string): Promise<void> {
   const sb = getSupabaseBrowserClient();
+  const shareId = boardShareIdOrThrow();
   const { error } = await sb.from("members").delete().eq("id", memberId).eq("share_id", shareId);
   if (error) throw error;
 }
@@ -159,8 +173,9 @@ export async function deleteMember(shareId: string, memberId: string): Promise<v
  * share_id 기준 동기화. user_id가 있는 행은 삭제하지 않고(다른 탭/자동 생성 보호),
  * 클라이언트 목록과 upsert로 맞춘다. user_id가 없는 행만 삭제 후 수동 목록을 insert.
  */
-export async function replaceMembers(shareId: string, members: MemberSyncInput[]): Promise<void> {
+export async function replaceMembers(members: MemberSyncInput[]): Promise<void> {
   const sb = getSupabaseBrowserClient();
+  const shareId = boardShareIdOrThrow();
   const { error: delErr } = await sb.from("members").delete().eq("share_id", shareId).is("user_id", null);
   if (delErr) throw delErr;
 
@@ -180,8 +195,9 @@ export async function replaceMembers(shareId: string, members: MemberSyncInput[]
 }
 
 /** 로컬 state 기준으로 원격 프로젝트 삭제 후 전부 upsert */
-export async function syncProjects(shareId: string, projects: ProjectSyncInput[]): Promise<void> {
+export async function syncProjects(projects: ProjectSyncInput[]): Promise<void> {
   const sb = getSupabaseBrowserClient();
+  const shareId = boardShareIdOrThrow();
   const keepIds = new Set(projects.map((p) => p.id));
 
   const { data: remote, error: selErr } = await sb.from("projects").select("id").eq("share_id", shareId);
@@ -190,16 +206,16 @@ export async function syncProjects(shareId: string, projects: ProjectSyncInput[]
   for (const r of remote ?? []) {
     const rid = (r as { id: string }).id;
     if (!keepIds.has(rid)) {
-      await deleteProject(shareId, rid);
+      await deleteProject(rid);
     }
   }
 
   for (const p of projects) {
-    await upsertProject(shareId, p);
+    await upsertProject(p);
   }
 }
 
-export async function syncDashboard(shareId: string, projects: ProjectSyncInput[], members: MemberSyncInput[]): Promise<void> {
-  await replaceMembers(shareId, members);
-  await syncProjects(shareId, projects);
+export async function syncDashboard(projects: ProjectSyncInput[], members: MemberSyncInput[]): Promise<void> {
+  await replaceMembers(members);
+  await syncProjects(projects);
 }
