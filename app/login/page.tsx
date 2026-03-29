@@ -1,17 +1,73 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { ensureBoardMemberForCurrentUser } from "@/app/actions/ensure-board-member";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import { FLOWCHART_LEGACY_STORAGE_KEY } from "@/lib/sync/constants";
 
-async function syncBoardMemberRowAfterAuth() {
-  const ensured = await ensureBoardMemberForCurrentUser();
-  if (!ensured.ok) {
-    console.error("[login] ensureBoardMemberForCurrentUser", ensured);
+async function syncCurrentUserIntoLegacyGlobalMembers(
+  supabase: ReturnType<typeof getSupabaseBrowserClient>
+) {
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return;
+
+  const uid = user.id;
+  const email = user.email ?? "";
+  const meta = user.user_metadata as Record<string, unknown> | undefined;
+  const fullName =
+    typeof meta?.full_name === "string"
+      ? meta.full_name
+      : typeof meta?.name === "string"
+        ? meta.name
+        : "";
+  const displayName =
+    fullName.trim() ||
+    (email.includes("@") ? email.split("@")[0]! : email) ||
+    "Member";
+  const id = `member-auth-${uid}`;
+
+  try {
+    const raw = localStorage.getItem(FLOWCHART_LEGACY_STORAGE_KEY);
+    let base: Record<string, unknown> = {};
+    if (raw) {
+      const p = JSON.parse(raw) as unknown;
+      if (p && typeof p === "object" && !Array.isArray(p)) {
+        base = { ...(p as Record<string, unknown>) };
+      }
+    }
+    const gmRaw = base.globalMembers;
+    const list: unknown[] = Array.isArray(gmRaw) ? [...gmRaw] : [];
+    const dup = list.some((m) => {
+      if (!m || typeof m !== "object") return false;
+      const o = m as Record<string, unknown>;
+      if (o.userId === uid || o.user_id === uid) return true;
+      if (email && typeof o.email === "string" && o.email.toLowerCase() === email.toLowerCase()) return true;
+      if (o.id === id) return true;
+      return false;
+    });
+    if (dup) return;
+    list.push({ id, name: displayName, email, role: "사용자", userId: uid });
+    base.globalMembers = list;
+    localStorage.setItem(FLOWCHART_LEGACY_STORAGE_KEY, JSON.stringify(base));
+  } catch {
+    /* ignore */
   }
-  return ensured;
+}
+
+async function afterAuthSyncMembers(supabase: ReturnType<typeof getSupabaseBrowserClient>) {
+  try {
+    const ensured = await ensureBoardMemberForCurrentUser();
+    if (!ensured.ok) {
+      console.error("[login] ensureBoardMemberForCurrentUser", ensured);
+    }
+  } catch (e) {
+    console.error("[login] ensureBoardMemberForCurrentUser", e);
+  }
+  await syncCurrentUserIntoLegacyGlobalMembers(supabase);
 }
 
 function LoginForm() {
@@ -26,23 +82,6 @@ function LoginForm() {
     urlError === "auth" ? "인증에 실패했습니다. 다시 시도해 주세요." : null
   );
   const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      const sb = getSupabaseBrowserClient();
-      const {
-        data: { user },
-      } = await sb.auth.getUser();
-      if (cancelled) return;
-      if (user && !searchParams.get("forceLogout")) {
-        router.push("/");
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [router, searchParams]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -75,10 +114,10 @@ function LoginForm() {
           return;
         }
         await supabase.auth.getSession();
-        await syncBoardMemberRowAfterAuth();
-        const next = searchParams.get("next") ?? "/";
-        router.push(next.startsWith("/") ? next : "/");
+        await afterAuthSyncMembers(supabase);
+        router.push("/");
         router.refresh();
+        return;
       } else {
         const { error } = await supabase.auth.signInWithPassword({
           email: emailTrimmed,
@@ -86,10 +125,10 @@ function LoginForm() {
         });
         if (error) throw error;
         await supabase.auth.getSession();
-        await syncBoardMemberRowAfterAuth();
-        const next = searchParams.get("next") ?? "/";
-        router.push(next.startsWith("/") ? next : "/");
+        await afterAuthSyncMembers(supabase);
+        router.push("/");
         router.refresh();
+        return;
       }
     } catch (err: unknown) {
       setMessage(err instanceof Error ? err.message : "오류가 발생했습니다.");

@@ -4,23 +4,21 @@ import { NextResponse, type NextRequest } from "next/server";
 type CookieRow = { name: string; value: string; options: CookieOptions };
 
 export async function middleware(request: NextRequest) {
-  if (request.nextUrl.searchParams.get("forceLogout") === "1") {
+  const path = request.nextUrl.pathname;
+  if (path.startsWith("/api/")) {
     return NextResponse.next();
   }
 
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
   const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim();
-
   if (!url || !key) {
-    return NextResponse.next();
-  }
-
-  const path = request.nextUrl.pathname;
-  const isLogin = path === "/login" || path.startsWith("/login/");
-  const isSignOut = path === "/auth/sign-out";
-  const isAuthRoute = path.startsWith("/auth/");
-
-  if (isLogin || isSignOut) {
+    const isLogin = path === "/login" || path.startsWith("/login/");
+    const isAuthRoute = path.startsWith("/auth/");
+    if (!isLogin && !isAuthRoute) {
+      const redirectUrl = request.nextUrl.clone();
+      redirectUrl.pathname = "/login";
+      return NextResponse.redirect(redirectUrl);
+    }
     return NextResponse.next();
   }
 
@@ -35,9 +33,7 @@ export async function middleware(request: NextRequest) {
         cookiesToSet.forEach(({ name, value }: CookieRow) => {
           request.cookies.set(name, value);
         });
-
         supabaseResponse = NextResponse.next({ request });
-
         cookiesToSet.forEach(({ name, value, options }: CookieRow) => {
           supabaseResponse.cookies.set(name, value, options);
         });
@@ -49,17 +45,12 @@ export async function middleware(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser();
 
-  if (!user && !isAuthRoute) {
+  const isLogin = path === "/login" || path.startsWith("/login/");
+  const isAuthRoute = path.startsWith("/auth/");
+
+  if (!user && !isLogin && !isAuthRoute) {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = "/login";
-    redirectUrl.searchParams.set("next", path);
-    return NextResponse.redirect(redirectUrl);
-  }
-
-  if (user && isLogin) {
-    const redirectUrl = request.nextUrl.clone();
-    redirectUrl.pathname = "/";
-    redirectUrl.search = "";
     return NextResponse.redirect(redirectUrl);
   }
 
