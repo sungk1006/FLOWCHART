@@ -109,6 +109,11 @@ export async function ensureBoardMemberForCurrentUser(): Promise<EnsureBoardMemb
   });
 
   if (insErr) {
+    const code = (insErr as { code?: string }).code;
+    const msg = insErr.message ?? "";
+    if (code === "23505" || msg.toLowerCase().includes("duplicate") || msg.includes("unique")) {
+      return { ok: true, created: false };
+    }
     return { ok: false, reason: "db_error", message: insErr.message };
   }
 

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 
+import { ensureBoardMemberForCurrentUser } from "@/app/actions/ensure-board-member";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 export async function GET(request: Request) {
@@ -13,6 +14,10 @@ export async function GET(request: Request) {
     if (error) {
       console.error("[auth/callback]", error.message);
       return NextResponse.redirect(`${origin}/login?error=auth`);
+    }
+    const ensured = await ensureBoardMemberForCurrentUser();
+    if (!ensured.ok) {
+      console.error("[auth/callback] ensureBoardMemberForCurrentUser", ensured);
     }
   }
 

@@ -121,8 +121,6 @@ export async function loadDashboard(): Promise<{
   if (pmRes.error) throw pmRes.error;
   if (mbRes.error) throw mbRes.error;
 
-  console.log("[DEBUG] DB members raw", mbRes.data);
-
   const rawMembers = (mbRes.data ?? []) as Record<string, unknown>[];
   const members: MemberRow[] = rawMembers.map((r) => ({
     id: String(r.id),

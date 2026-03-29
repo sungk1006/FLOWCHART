@@ -4,9 +4,23 @@ import { NextResponse, type NextRequest } from "next/server";
 type CookieRow = { name: string; value: string; options: CookieOptions };
 
 export async function middleware(request: NextRequest) {
+  if (request.nextUrl.searchParams.get("forceLogout") === "1") {
+    return NextResponse.next();
+  }
+
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
   const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim();
+
   if (!url || !key) {
+    return NextResponse.next();
+  }
+
+  const path = request.nextUrl.pathname;
+  const isLogin = path === "/login" || path.startsWith("/login/");
+  const isSignOut = path === "/auth/sign-out";
+  const isAuthRoute = path.startsWith("/auth/");
+
+  if (isLogin || isSignOut) {
     return NextResponse.next();
   }
 
@@ -18,11 +32,15 @@ export async function middleware(request: NextRequest) {
         return request.cookies.getAll();
       },
       setAll(cookiesToSet: CookieRow[]) {
-        cookiesToSet.forEach(({ name, value }: CookieRow) => request.cookies.set(name, value));
+        cookiesToSet.forEach(({ name, value }: CookieRow) => {
+          request.cookies.set(name, value);
+        });
+
         supabaseResponse = NextResponse.next({ request });
-        cookiesToSet.forEach(({ name, value, options }: CookieRow) =>
-          supabaseResponse.cookies.set(name, value, options)
-        );
+
+        cookiesToSet.forEach(({ name, value, options }: CookieRow) => {
+          supabaseResponse.cookies.set(name, value, options);
+        });
       },
     },
   });
@@ -31,18 +49,14 @@ export async function middleware(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser();
 
-  const path = request.nextUrl.pathname;
-  const isLogin = path === "/login" || path.startsWith("/login/");
-  const isAuthRoute = path.startsWith("/auth/");
-
-  if (!user && !isLogin && !isAuthRoute) {
+  if (!user && !isAuthRoute) {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = "/login";
     redirectUrl.searchParams.set("next", path);
     return NextResponse.redirect(redirectUrl);
   }
 
-  if (user && path === "/login") {
+  if (user && isLogin) {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = "/";
     redirectUrl.search = "";

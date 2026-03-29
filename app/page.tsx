@@ -1,6 +1,5 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -24,6 +23,7 @@ import {
   rowToMember,
   rowToProject,
   syncDashboard,
+  type MemberRow,
   type ProjectRow,
 } from "@/lib/sync/dashboard";
 
@@ -157,8 +157,9 @@ function normalizeStoredMembers(raw: unknown): Member[] {
     if (!m || typeof m !== "object") continue;
     const o = m as Record<string, unknown>;
     if (typeof o.id !== "string") continue;
-    const role = o.role;
-    if (role !== "관리자" && role !== "사용자") continue;
+    const roleRaw = o.role;
+    const role: MemberRole =
+      roleRaw === "관리자" ? "관리자" : roleRaw === "사용자" ? "사용자" : "사용자";
 
     const name = typeof o.name === "string" ? o.name : o.name == null ? "" : String(o.name);
     const email = typeof o.email === "string" ? o.email : o.email == null ? "" : String(o.email);
@@ -183,7 +184,7 @@ function normalizeStoredMembers(raw: unknown): Member[] {
       id: o.id,
       name,
       email,
-      role: role as MemberRole,
+      role,
     };
     if (normalizedUserId !== undefined) {
       member.userId = normalizedUserId;
@@ -642,7 +643,6 @@ function realtimeEventMatchesShare(
 }
 
 export default function Page() {
-  const router = useRouter();
   const [projects, setProjects] = useState<Project[]>(initialProjects);
   const [selectedId, setSelectedId] = useState<string>(initialProjects[0]?.id ?? "");
 
@@ -678,36 +678,89 @@ export default function Page() {
   const realtimeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastRemoteFingerprintRef = useRef<string>("");
   const realtimeChannelRef = useRef<RealtimeChannel | null>(null);
+  /** Supabase 경로에서 loadDashboard 1회 이상 성공해 멤버 state를 채운 뒤에만 sync 허용 (빈 배열로 덮어쓰기 방지) */
+  const supabaseMembersHydratedRef = useRef(false);
+  /** loadDashboard 동시 호출 시 오래된 응답이 state를 덮어쓰지 않도록 마지막 요청만 반영 */
+  const remoteDashboardLoadGenRef = useRef(0);
 
   const subscriptionShareId =
     storageReady && isSupabaseDashboardEnabled() ? getFlowchartShareId()?.trim() || null : null;
+
+  const FLOWCHART_MEMBERS_STORAGE_KEY = "flowchart-members";
+
+  function applyMembers(members: Member[] | null | undefined): Member[] {
+    if (!members || members.length === 0) {
+      const fallback: Member[] = [
+        {
+          id: "local-admin",
+          name: "Admin",
+          email: "admin@test.com",
+          role: "관리자",
+        },
+      ];
+      setGlobalMembers(fallback);
+      try {
+        localStorage.setItem(FLOWCHART_MEMBERS_STORAGE_KEY, JSON.stringify(fallback));
+      } catch {
+        /* ignore */
+      }
+      return fallback;
+    }
+    setGlobalMembers(members);
+    try {
+      localStorage.setItem(FLOWCHART_MEMBERS_STORAGE_KEY, JSON.stringify(members));
+    } catch {
+      /* ignore */
+    }
+    return members;
+  }
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(FLOWCHART_MEMBERS_STORAGE_KEY);
+      if (saved) {
+        setGlobalMembers(normalizeStoredMembers(JSON.parse(saved)));
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     const sb = getSupabaseBrowserClient();
 
     async function applyDashboardFromRemote() {
+      const loadGen = ++remoteDashboardLoadGenRef.current;
       const ensured = await ensureBoardMemberForCurrentUser();
       if (!ensured.ok) {
         console.error("[flowchart] ensureBoardMemberForCurrentUser failed", ensured);
       }
       const data = await loadDashboard();
       if (cancelled) return;
+      if (loadGen !== remoteDashboardLoadGenRef.current) {
+        return;
+      }
 
       const serverMembers = Array.isArray(data.members) ? data.members : [];
-      console.log("[DEBUG] loadDashboard raw members", serverMembers);
       const beforeNormalize = serverMembers.map((row) => rowToMember(row));
-      console.log("[DEBUG] before normalize", beforeNormalize);
       const members = normalizeStoredMembers(beforeNormalize);
-      console.log("[DEBUG] after normalize", members);
-      const memberIds = new Set(members.map((m) => m.id));
-      const restored = normalizeStoredProjects(
-        data.projects.map((row) => projectFromStorage(rowToProject(row as ProjectRow)))
-      );
-      const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
-      const finalProjects = next.length > 0 ? next : initialProjects;
+      const effectiveMembers = applyMembers(members);
 
-      setGlobalMembers(members);
+      const memberIds = new Set(effectiveMembers.map((m) => m.id));
+      let finalProjects: Project[];
+      try {
+        const restored = normalizeStoredProjects(
+          data.projects.map((row) => projectFromStorage(rowToProject(row as ProjectRow)))
+        );
+        const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
+        finalProjects = next.length > 0 ? next : initialProjects;
+      } catch (e) {
+        console.error("[flowchart] project restore failed (members는 이미 반영됨)", e);
+        finalProjects = projects.length > 0 ? projects : initialProjects;
+      }
+
+      supabaseMembersHydratedRef.current = true;
       setProjects(finalProjects);
 
       const ids = new Set(finalProjects.map((p) => p.id));
@@ -741,7 +794,6 @@ export default function Page() {
     });
 
     async function run() {
-      console.log("[DEBUG] isSupabaseDashboardEnabled", isSupabaseDashboardEnabled());
       if (isSupabaseDashboardEnabled()) {
         const shareId = getFlowchartShareId()?.trim() ?? "";
         const {
@@ -770,14 +822,14 @@ export default function Page() {
         const parsed = parsePersistedJson(raw);
         if (!parsed) return;
 
-        const members = normalizeStoredMembers(parsed.globalMembers);
-        const memberIds = new Set(members.map((m) => m.id));
+        const normalizedMembers = normalizeStoredMembers(parsed.globalMembers);
+        const effectiveLegacy = applyMembers(normalizedMembers);
+        const memberIds = new Set(effectiveLegacy.map((m) => m.id));
 
         if (Array.isArray(parsed.projects)) {
           const restored = normalizeStoredProjects(parsed.projects);
           const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
           if (!cancelled) {
-            setGlobalMembers(members);
             setProjects(next);
             const ids = new Set(next.map((p) => p.id));
             const rawSid = parsed.selectedId;
@@ -789,8 +841,6 @@ export default function Page() {
                   : (next[0]?.id ?? "");
             setSelectedId(sid);
           }
-        } else if (!cancelled) {
-          setGlobalMembers(members);
         }
       } catch {
         // 손상된 JSON 등 — 초기 상태 유지
@@ -832,10 +882,12 @@ export default function Page() {
   useEffect(() => {
     if (!isSupabaseDashboardEnabled() || !storageReady) return;
     if (!getFlowchartShareId()) return;
+    if (!supabaseMembersHydratedRef.current) return;
 
     if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
     syncTimerRef.current = setTimeout(() => {
       syncTimerRef.current = null;
+      if (!supabaseMembersHydratedRef.current) return;
       void syncDashboard(projects, globalMembers).catch((e) => {
         console.error("[flowchart] syncDashboard failed", e);
       });
@@ -876,52 +928,39 @@ export default function Page() {
     teardownRealtimeChannel();
 
     async function applyRemoteDashboard() {
-      console.log("[flowchart] loadDashboard start", { shareId: shareIdLocked });
+      const loadGen = ++remoteDashboardLoadGenRef.current;
       try {
         const data = await loadDashboard();
+        if (loadGen !== remoteDashboardLoadGenRef.current) {
+          return;
+        }
         const serverMemberRows = Array.isArray(data.members) ? data.members : [];
-        console.log("[flowchart] loadDashboard finish", {
-          shareId: shareIdLocked,
-          memberRows: serverMemberRows.length,
-          projectRows: data.projects.length,
-        });
 
-        const members = normalizeStoredMembers(serverMemberRows.map((row) => rowToMember(row)));
-        const memberIds = new Set(members.map((m) => m.id));
+        const beforeNormalizeRemote = serverMemberRows.map((row) => rowToMember(row));
+        const members = normalizeStoredMembers(beforeNormalizeRemote);
+        const effectiveRemote = applyMembers(members);
+        supabaseMembersHydratedRef.current = true;
+
+        const memberIds = new Set(effectiveRemote.map((m) => m.id));
         const restored = normalizeStoredProjects(
           data.projects.map((row) => projectFromStorage(rowToProject(row as ProjectRow)))
         );
         const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
         const finalProjects = next.length > 0 ? next : initialProjects;
 
-        setGlobalMembers(members);
-
-        const fp = dashboardDataFingerprint(members, finalProjects);
+        const fp = dashboardDataFingerprint(effectiveRemote, finalProjects);
         const fpSame = fp === lastRemoteFingerprintRef.current;
-        if (fpSame) {
-          console.log("[flowchart] dashboardDataFingerprint: same as last applied", { shareId: shareIdLocked });
-        } else {
-          console.log("[flowchart] dashboardDataFingerprint: changed", { shareId: shareIdLocked });
-        }
 
         if (fpSame && !DEBUG_REALTIME_DISABLE_FINGERPRINT_SKIP) {
-          console.log("[flowchart] applyRemote early return (fingerprint unchanged)", { shareId: shareIdLocked });
           return;
         }
 
         lastRemoteFingerprintRef.current = fp;
 
-        console.log("[flowchart] applyRemote applying setState", {
-          shareId: shareIdLocked,
-          members: members.length,
-          projects: finalProjects.length,
-        });
-
         setProjects(finalProjects);
         setSelectedId((prev) => {
           const ids = new Set(finalProjects.map((p) => p.id));
           if (ids.has(prev)) {
-            console.log("[flowchart] setSelectedId keep prev", { shareId: shareIdLocked, prev });
             return prev;
           }
           let rawSid: string | null = null;
@@ -931,15 +970,12 @@ export default function Page() {
             /* ignore */
           }
           if (finalProjects.length === 0) {
-            console.log("[flowchart] setSelectedId clear (no projects)", { shareId: shareIdLocked });
             return "";
           }
           if (typeof rawSid === "string" && ids.has(rawSid)) {
-            console.log("[flowchart] setSelectedId from localStorage", { shareId: shareIdLocked, rawSid });
             return rawSid;
           }
           const first = finalProjects[0]?.id ?? "";
-          console.log("[flowchart] setSelectedId fallback first project", { shareId: shareIdLocked, first });
           return first;
         });
       } catch (e) {
@@ -947,8 +983,7 @@ export default function Page() {
       }
     }
 
-    function scheduleRemoteReload(source: string) {
-      console.log("[flowchart] scheduleRemoteReload", { shareId: shareIdLocked, source });
+    function scheduleRemoteReload(_source: string) {
       if (realtimeDebounceRef.current) clearTimeout(realtimeDebounceRef.current);
       realtimeDebounceRef.current = setTimeout(() => {
         realtimeDebounceRef.current = null;
@@ -969,17 +1004,7 @@ export default function Page() {
         new?: { share_id?: string };
         old?: { share_id?: string };
       }) => {
-        const shareFromPayload = realtimePayloadShareId(payload);
-        console.log("[flowchart] postgres_changes received", {
-          shareId: shareIdLocked,
-          table,
-          eventType: payload.eventType,
-          share_id: shareFromPayload,
-          expectedShareId: shareIdLocked,
-          useServerFilter,
-        });
         if (!useServerFilter && !realtimeEventMatchesShare(payload, shareIdLocked)) {
-          console.log("[flowchart] postgres_changes ignored (client share filter)", { shareId: shareIdLocked, table });
           return;
         }
         scheduleRemoteReload(`${table}:${payload.eventType ?? "?"}`);
@@ -999,22 +1024,7 @@ export default function Page() {
         .on("postgres_changes", { event: "*", schema: "public", table: "members" }, onPostgresChange("members"));
     }
 
-    channel.subscribe((status, err) => {
-      console.log("[flowchart] realtime subscription status:", {
-        shareId: shareIdLocked,
-        status,
-        err: err?.message ?? null,
-        channelTopic,
-      });
-      if (status === "SUBSCRIBED") {
-        console.log("[flowchart] realtime SUBSCRIBED", {
-          shareId: shareIdLocked,
-          tables: ["projects", "members"],
-          serverSideShareFilter: useServerFilter,
-          DEBUG_REALTIME_DISABLE_FINGERPRINT_SKIP,
-        });
-      }
-    });
+    channel.subscribe(() => {});
 
     realtimeChannelRef.current = channel;
 
@@ -1303,24 +1313,17 @@ export default function Page() {
       return;
     }
 
-    setGlobalMembers((prev) => [...prev, createMember(name, email, memberForm.role)]);
+    applyMembers([...globalMembers, createMember(name, email, memberForm.role)]);
     setMemberForm(emptyMemberForm());
   }
 
   function removeGlobalMember(memberId: string) {
-    let blocked = false;
-    setGlobalMembers((prev) => {
-      const target = prev.find((m) => m.id === memberId);
-      if (target?.userId) {
-        blocked = true;
-        return prev;
-      }
-      return prev.filter((member) => member.id !== memberId);
-    });
-    if (blocked) {
+    const target = globalMembers.find((m) => m.id === memberId);
+    if (target?.userId) {
       alert("계정과 연결된 멤버는 목록에서 삭제할 수 없습니다.");
       return;
     }
+    applyMembers(globalMembers.filter((member) => member.id !== memberId));
 
     setProjects((prev) =>
       prev.map((project) => ({
@@ -1594,17 +1597,6 @@ export default function Page() {
   const selectedNextDue = selectedProject ? getNextDueStep(selectedProject) : null;
   const selectedOverdueCount = selectedProject ? getOverdueCount(selectedProject) : 0;
 
-  async function handleLogout() {
-    try {
-      const supabase = getSupabaseBrowserClient();
-      await supabase.auth.signOut();
-    } catch {
-      /* noop */
-    }
-    router.push("/login");
-    router.refresh();
-  }
-
   return (
     <div className="min-h-screen bg-[#f6f5f3] text-neutral-900">
       <div className="mx-auto flex max-w-[1880px] gap-4 px-4 py-4">
@@ -1613,7 +1605,17 @@ export default function Page() {
             <div className="mb-2 flex items-center justify-end">
               <button
                 type="button"
-                onClick={() => void handleLogout()}
+                onClick={() => {
+                  console.log("🔥 logout clicked");
+                  localStorage.clear();
+                  sessionStorage.clear();
+                  document.cookie.split(";").forEach((c) => {
+                    document.cookie = c
+                      .replace(/^ +/, "")
+                      .replace(/=.*/, "=;expires=" + new Date(0).toUTCString() + ";path=/");
+                  });
+                  window.location.replace("/login?forceLogout=1");
+                }}
                 className="relative z-[60] cursor-pointer rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium text-neutral-600 pointer-events-auto hover:bg-neutral-50"
               >
                 로그아웃

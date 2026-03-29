@@ -1,9 +1,18 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
+import { ensureBoardMemberForCurrentUser } from "@/app/actions/ensure-board-member";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+
+async function syncBoardMemberRowAfterAuth() {
+  const ensured = await ensureBoardMemberForCurrentUser();
+  if (!ensured.ok) {
+    console.error("[login] ensureBoardMemberForCurrentUser", ensured);
+  }
+  return ensured;
+}
 
 function LoginForm() {
   const router = useRouter();
@@ -18,6 +27,23 @@ function LoginForm() {
   );
   const [loading, setLoading] = useState(false);
 
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const sb = getSupabaseBrowserClient();
+      const {
+        data: { user },
+      } = await sb.auth.getUser();
+      if (cancelled) return;
+      if (user && !searchParams.get("forceLogout")) {
+        router.push("/");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [router, searchParams]);
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
@@ -26,10 +52,14 @@ function LoginForm() {
     const emailTrimmed = email.trim();
     try {
       if (mode === "signup") {
+        const localPart = emailTrimmed.includes("@") ? emailTrimmed.split("@")[0]! : emailTrimmed;
         const { error } = await supabase.auth.signUp({
           email: emailTrimmed,
           password,
-          options: { emailRedirectTo: `${window.location.origin}/auth/callback` },
+          options: {
+            emailRedirectTo: `${window.location.origin}/auth/callback`,
+            data: { full_name: localPart || "Member", name: localPart || "Member" },
+          },
         });
         if (error) throw error;
 
@@ -44,6 +74,8 @@ function LoginForm() {
           router.refresh();
           return;
         }
+        await supabase.auth.getSession();
+        await syncBoardMemberRowAfterAuth();
         const next = searchParams.get("next") ?? "/";
         router.push(next.startsWith("/") ? next : "/");
         router.refresh();
@@ -53,6 +85,8 @@ function LoginForm() {
           password,
         });
         if (error) throw error;
+        await supabase.auth.getSession();
+        await syncBoardMemberRowAfterAuth();
         const next = searchParams.get("next") ?? "/";
         router.push(next.startsWith("/") ? next : "/");
         router.refresh();
