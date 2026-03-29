@@ -11,19 +11,12 @@ import { type MentionNotifyResponse } from "@/lib/mention-email";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
-import {
-  FLOWCHART_LEGACY_STORAGE_KEY,
-  FLOWCHART_SELECTED_ID_KEY,
-  getFlowchartShareId,
-  isSupabaseDashboardEnabled,
-} from "@/lib/sync/constants";
+import { FLOWCHART_LEGACY_STORAGE_KEY, getFlowchartShareId, isSupabaseDashboardEnabled } from "@/lib/sync/constants";
 import { ensureBoardMemberForCurrentUser } from "@/app/actions/ensure-board-member";
 import {
-  loadDashboard,
-  rowToMember,
+  loadProjectsOnly,
   rowToProject,
-  syncDashboard,
-  type MemberRow,
+  syncProjectsOnly,
   type ProjectRow,
 } from "@/lib/sync/dashboard";
 
@@ -615,10 +608,9 @@ function applyDueReminderJobResults(prev: Project[], results: DueReminderJobResu
   });
 }
 
-function dashboardDataFingerprint(members: Member[], projects: Project[]): string {
-  const m = [...members].sort((a, b) => a.id.localeCompare(b.id));
+function dashboardDataFingerprint(projects: Project[]): string {
   const p = [...projects].sort((a, b) => a.id.localeCompare(b.id));
-  return JSON.stringify({ members: m, projects: p });
+  return JSON.stringify({ projects: p });
 }
 
 /** 디버그: true면 fingerprint 같아도 setState 적용(평소 false 유지) */
@@ -674,182 +666,41 @@ export default function Page() {
   const [dueReminderBusy, setDueReminderBusy] = useState(false);
   /** 첫 로드(Supabase 또는 레거시 localStorage) 완료 전에는 저장하지 않음 */
   const [storageReady, setStorageReady] = useState(false);
+
   const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const realtimeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastRemoteFingerprintRef = useRef<string>("");
   const realtimeChannelRef = useRef<RealtimeChannel | null>(null);
-  /** Supabase 경로에서 loadDashboard 1회 이상 성공해 멤버 state를 채운 뒤에만 sync 허용 (빈 배열로 덮어쓰기 방지) */
-  const supabaseMembersHydratedRef = useRef(false);
-  /** loadDashboard 동시 호출 시 오래된 응답이 state를 덮어쓰지 않도록 마지막 요청만 반영 */
-  const remoteDashboardLoadGenRef = useRef(0);
-
-  const subscriptionShareId =
-    storageReady && isSupabaseDashboardEnabled() ? getFlowchartShareId()?.trim() || null : null;
-
-  const FLOWCHART_MEMBERS_STORAGE_KEY = "flowchart-members";
-
-  function applyMembers(members: Member[] | null | undefined): Member[] {
-    if (!members || members.length === 0) {
-      const fallback: Member[] = [
-        {
-          id: "local-admin",
-          name: "Admin",
-          email: "admin@test.com",
-          role: "관리자",
-        },
-      ];
-      setGlobalMembers(fallback);
-      try {
-        localStorage.setItem(FLOWCHART_MEMBERS_STORAGE_KEY, JSON.stringify(fallback));
-      } catch {
-        /* ignore */
-      }
-      return fallback;
-    }
-    setGlobalMembers(members);
-    try {
-      localStorage.setItem(FLOWCHART_MEMBERS_STORAGE_KEY, JSON.stringify(members));
-    } catch {
-      /* ignore */
-    }
-    return members;
-  }
+  const remoteProjectsLoadGenRef = useRef(0);
+  /** 원격 프로젝트 병합·Realtime 시 assignee sanitize용 (멤버는 Supabase와 무관) */
+  const localMembersSnapshotRef = useRef<Member[]>([]);
+  const supabaseProjectsBootstrappedRef = useRef(false);
 
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem(FLOWCHART_MEMBERS_STORAGE_KEY);
-      if (saved) {
-        setGlobalMembers(normalizeStoredMembers(JSON.parse(saved)));
-      }
-    } catch {
-      /* ignore */
-    }
-  }, []);
+    localMembersSnapshotRef.current = globalMembers;
+  }, [globalMembers]);
 
   useEffect(() => {
-    let cancelled = false;
+    if (!isSupabaseDashboardEnabled()) return;
     const sb = getSupabaseBrowserClient();
+    let cancelled = false;
 
-    async function applyDashboardFromRemote() {
-      const loadGen = ++remoteDashboardLoadGenRef.current;
-      const ensured = await ensureBoardMemberForCurrentUser();
-      if (!ensured.ok) {
-        console.error("[flowchart] ensureBoardMemberForCurrentUser failed", ensured);
-      }
-      const data = await loadDashboard();
+    void sb.auth.getUser().then(({ data: { user } }) => {
       if (cancelled) return;
-      if (loadGen !== remoteDashboardLoadGenRef.current) {
-        return;
-      }
-
-      const serverMembers = Array.isArray(data.members) ? data.members : [];
-      const beforeNormalize = serverMembers.map((row) => rowToMember(row));
-      const members = normalizeStoredMembers(beforeNormalize);
-      const effectiveMembers = applyMembers(members);
-
-      const memberIds = new Set(effectiveMembers.map((m) => m.id));
-      let finalProjects: Project[];
-      try {
-        const restored = normalizeStoredProjects(
-          data.projects.map((row) => projectFromStorage(rowToProject(row as ProjectRow)))
-        );
-        const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
-        finalProjects = next.length > 0 ? next : initialProjects;
-      } catch (e) {
-        console.error("[flowchart] project restore failed (members는 이미 반영됨)", e);
-        finalProjects = projects.length > 0 ? projects : initialProjects;
-      }
-
-      supabaseMembersHydratedRef.current = true;
-      setProjects(finalProjects);
-
-      const ids = new Set(finalProjects.map((p) => p.id));
-      let rawSid: string | null = null;
-      try {
-        rawSid = localStorage.getItem(FLOWCHART_SELECTED_ID_KEY);
-      } catch {
-        /* ignore */
-      }
-      const sid =
-        finalProjects.length === 0
-          ? ""
-          : typeof rawSid === "string" && ids.has(rawSid)
-            ? rawSid
-            : (finalProjects[0]?.id ?? "");
-      setSelectedId(sid);
-    }
-
-    const {
-      data: { subscription },
-    } = sb.auth.onAuthStateChange(async (_event, session) => {
-      if (cancelled) return;
-      setAuthUserId(session?.user?.id ?? null);
-      if (!isSupabaseDashboardEnabled() || !session?.user) return;
-      if (!getFlowchartShareId()) return;
-      try {
-        await applyDashboardFromRemote();
-      } catch (e) {
-        console.error("[flowchart] loadDashboard failed", e);
+      setAuthUserId(user?.id ?? null);
+      if (!user) {
+        window.location.href = "/login";
       }
     });
 
-    async function run() {
-      if (isSupabaseDashboardEnabled()) {
-        const shareId = getFlowchartShareId()?.trim() ?? "";
-        const {
-          data: { user: initialUser },
-        } = await sb.auth.getUser();
-        if (!cancelled) setAuthUserId(initialUser?.id ?? null);
-
-        if (!shareId) {
-          if (!cancelled) setStorageReady(true);
-          return;
-        }
-        try {
-          await applyDashboardFromRemote();
-        } catch (e) {
-          console.error("[flowchart] loadDashboard failed", e);
-        } finally {
-          if (!cancelled) setStorageReady(true);
-        }
-        return;
+    const {
+      data: { subscription },
+    } = sb.auth.onAuthStateChange((_event, session) => {
+      setAuthUserId(session?.user?.id ?? null);
+      if (!session?.user) {
+        window.location.href = "/login";
       }
-
-      try {
-        const raw = localStorage.getItem(FLOWCHART_LEGACY_STORAGE_KEY);
-        if (!raw) return;
-
-        const parsed = parsePersistedJson(raw);
-        if (!parsed) return;
-
-        const normalizedMembers = normalizeStoredMembers(parsed.globalMembers);
-        const effectiveLegacy = applyMembers(normalizedMembers);
-        const memberIds = new Set(effectiveLegacy.map((m) => m.id));
-
-        if (Array.isArray(parsed.projects)) {
-          const restored = normalizeStoredProjects(parsed.projects);
-          const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
-          if (!cancelled) {
-            setProjects(next);
-            const ids = new Set(next.map((p) => p.id));
-            const rawSid = parsed.selectedId;
-            const sid =
-              next.length === 0
-                ? ""
-                : typeof rawSid === "string" && ids.has(rawSid)
-                  ? rawSid
-                  : (next[0]?.id ?? "");
-            setSelectedId(sid);
-          }
-        }
-      } catch {
-        // 손상된 JSON 등 — 초기 상태 유지
-      } finally {
-        if (!cancelled) setStorageReady(true);
-      }
-    }
-
-    void run();
+    });
 
     return () => {
       cancelled = true;
@@ -857,17 +708,126 @@ export default function Page() {
     };
   }, []);
 
+  const subscriptionShareId =
+    storageReady && isSupabaseDashboardEnabled() ? getFlowchartShareId()?.trim() || null : null;
+
   useEffect(() => {
-    if (typeof window === "undefined" || !storageReady) return;
+    let cancelled = false;
+    let hydratedMembers: Member[] = [];
+
     try {
-      if (isSupabaseDashboardEnabled()) {
-        if (selectedId) {
-          localStorage.setItem(FLOWCHART_SELECTED_ID_KEY, selectedId);
-        } else {
-          localStorage.removeItem(FLOWCHART_SELECTED_ID_KEY);
+      const raw = localStorage.getItem(FLOWCHART_LEGACY_STORAGE_KEY);
+      if (raw) {
+        const parsed = parsePersistedJson(raw);
+        if (parsed) {
+          if (parsed.globalMembers != null) {
+            hydratedMembers = normalizeStoredMembers(parsed.globalMembers);
+            if (!cancelled) {
+              setGlobalMembers(hydratedMembers);
+              localMembersSnapshotRef.current = hydratedMembers;
+            }
+          }
+          if (Array.isArray(parsed.projects)) {
+            const restored = normalizeStoredProjects(parsed.projects);
+            const memberIds = new Set(hydratedMembers.map((m) => m.id));
+            const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
+            if (!cancelled && next.length > 0) {
+              setProjects(next);
+              const ids = new Set(next.map((p) => p.id));
+              const rawSid = parsed.selectedId;
+              const sid =
+                next.length === 0
+                  ? ""
+                  : typeof rawSid === "string" && ids.has(rawSid)
+                    ? rawSid
+                    : (next[0]?.id ?? "");
+              setSelectedId(sid);
+            }
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    if (!isSupabaseDashboardEnabled()) {
+      if (!cancelled) {
+        supabaseProjectsBootstrappedRef.current = true;
+        setStorageReady(true);
+      }
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    /* 원격 프로젝트 로드 전에도 localStorage persist(멤버 포함)가 돌 수 있게 함 */
+    if (!cancelled) {
+      setStorageReady(true);
+    }
+
+    async function loadRemoteProjectsIfNeeded() {
+
+      const {
+        data: { user },
+      } = await getSupabaseBrowserClient().auth.getUser();
+      if (cancelled) return;
+      if (!user) {
+        supabaseProjectsBootstrappedRef.current = true;
+        setStorageReady(true);
+        return;
+      }
+
+      const shareId = getFlowchartShareId()?.trim() ?? "";
+      if (!shareId) {
+        if (!cancelled) {
+          supabaseProjectsBootstrappedRef.current = true;
+          setStorageReady(true);
         }
         return;
       }
+
+      const loadGen = ++remoteProjectsLoadGenRef.current;
+      try {
+        const ensured = await ensureBoardMemberForCurrentUser();
+        if (!ensured.ok) {
+          console.error("[flowchart] ensureBoardMemberForCurrentUser failed", ensured);
+        }
+        const data = await loadProjectsOnly();
+        if (cancelled || loadGen !== remoteProjectsLoadGenRef.current) return;
+
+        const memberIds = new Set(localMembersSnapshotRef.current.map((m) => m.id));
+        const restored = normalizeStoredProjects(
+          data.projects.map((row) => projectFromStorage(rowToProject(row as ProjectRow)))
+        );
+        const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
+        const finalProjects = next.length > 0 ? next : initialProjects;
+        setProjects(finalProjects);
+        setSelectedId((prev) => {
+          const ids = new Set(finalProjects.map((p) => p.id));
+          if (finalProjects.length === 0) return "";
+          if (ids.has(prev)) return prev;
+          return finalProjects[0]?.id ?? "";
+        });
+      } catch (e) {
+        console.error("[flowchart] loadProjectsOnly failed", e);
+      } finally {
+        if (!cancelled) {
+          supabaseProjectsBootstrappedRef.current = true;
+          setStorageReady(true);
+        }
+      }
+    }
+
+    void loadRemoteProjectsIfNeeded();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !storageReady) return;
+    try {
       const payload: PersistedState = {
         projects,
         selectedId,
@@ -882,14 +842,14 @@ export default function Page() {
   useEffect(() => {
     if (!isSupabaseDashboardEnabled() || !storageReady) return;
     if (!getFlowchartShareId()) return;
-    if (!supabaseMembersHydratedRef.current) return;
+    if (!supabaseProjectsBootstrappedRef.current) return;
 
     if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
     syncTimerRef.current = setTimeout(() => {
       syncTimerRef.current = null;
-      if (!supabaseMembersHydratedRef.current) return;
-      void syncDashboard(projects, globalMembers).catch((e) => {
-        console.error("[flowchart] syncDashboard failed", e);
+      if (!supabaseProjectsBootstrappedRef.current) return;
+      void syncProjectsOnly(projects).catch((e) => {
+        console.error("[flowchart] syncProjectsOnly failed", e);
       });
     }, 800);
 
@@ -899,7 +859,7 @@ export default function Page() {
         syncTimerRef.current = null;
       }
     };
-  }, [projects, globalMembers, storageReady]);
+  }, [projects, storageReady]);
 
   useEffect(() => {
     function teardownRealtimeChannel() {
@@ -928,27 +888,20 @@ export default function Page() {
     teardownRealtimeChannel();
 
     async function applyRemoteDashboard() {
-      const loadGen = ++remoteDashboardLoadGenRef.current;
+      const loadGen = ++remoteProjectsLoadGenRef.current;
       try {
-        const data = await loadDashboard();
-        if (loadGen !== remoteDashboardLoadGenRef.current) {
+        const data = await loadProjectsOnly();
+        if (loadGen !== remoteProjectsLoadGenRef.current) {
           return;
         }
-        const serverMemberRows = Array.isArray(data.members) ? data.members : [];
-
-        const beforeNormalizeRemote = serverMemberRows.map((row) => rowToMember(row));
-        const members = normalizeStoredMembers(beforeNormalizeRemote);
-        const effectiveRemote = applyMembers(members);
-        supabaseMembersHydratedRef.current = true;
-
-        const memberIds = new Set(effectiveRemote.map((m) => m.id));
+        const memberIds = new Set(localMembersSnapshotRef.current.map((m) => m.id));
         const restored = normalizeStoredProjects(
           data.projects.map((row) => projectFromStorage(rowToProject(row as ProjectRow)))
         );
         const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
         const finalProjects = next.length > 0 ? next : initialProjects;
 
-        const fp = dashboardDataFingerprint(effectiveRemote, finalProjects);
+        const fp = dashboardDataFingerprint(finalProjects);
         const fpSame = fp === lastRemoteFingerprintRef.current;
 
         if (fpSame && !DEBUG_REALTIME_DISABLE_FINGERPRINT_SKIP) {
@@ -963,17 +916,8 @@ export default function Page() {
           if (ids.has(prev)) {
             return prev;
           }
-          let rawSid: string | null = null;
-          try {
-            rawSid = localStorage.getItem(FLOWCHART_SELECTED_ID_KEY);
-          } catch {
-            /* ignore */
-          }
           if (finalProjects.length === 0) {
             return "";
-          }
-          if (typeof rawSid === "string" && ids.has(rawSid)) {
-            return rawSid;
           }
           const first = finalProjects[0]?.id ?? "";
           return first;
@@ -998,7 +942,7 @@ export default function Page() {
       );
     }
 
-    function onPostgresChange(table: "projects" | "members") {
+    function onPostgresChange() {
       return (payload: {
         eventType?: string;
         new?: { share_id?: string };
@@ -1007,7 +951,7 @@ export default function Page() {
         if (!useServerFilter && !realtimeEventMatchesShare(payload, shareIdLocked)) {
           return;
         }
-        scheduleRemoteReload(`${table}:${payload.eventType ?? "?"}`);
+        scheduleRemoteReload(`projects:${payload.eventType ?? "?"}`);
       };
     }
 
@@ -1015,13 +959,13 @@ export default function Page() {
     const channel = sb.channel(channelTopic);
     if (useServerFilter) {
       const filter = `share_id=eq.${shareIdLocked}`;
-      channel
-        .on("postgres_changes", { event: "*", schema: "public", table: "projects", filter }, onPostgresChange("projects"))
-        .on("postgres_changes", { event: "*", schema: "public", table: "members", filter }, onPostgresChange("members"));
+      channel.on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "projects", filter },
+        onPostgresChange()
+      );
     } else {
-      channel
-        .on("postgres_changes", { event: "*", schema: "public", table: "projects" }, onPostgresChange("projects"))
-        .on("postgres_changes", { event: "*", schema: "public", table: "members" }, onPostgresChange("members"));
+      channel.on("postgres_changes", { event: "*", schema: "public", table: "projects" }, onPostgresChange());
     }
 
     channel.subscribe(() => {});
@@ -1313,7 +1257,7 @@ export default function Page() {
       return;
     }
 
-    applyMembers([...globalMembers, createMember(name, email, memberForm.role)]);
+    setGlobalMembers([...globalMembers, createMember(name, email, memberForm.role)]);
     setMemberForm(emptyMemberForm());
   }
 
@@ -1323,7 +1267,7 @@ export default function Page() {
       alert("계정과 연결된 멤버는 목록에서 삭제할 수 없습니다.");
       return;
     }
-    applyMembers(globalMembers.filter((member) => member.id !== memberId));
+    setGlobalMembers(globalMembers.filter((member) => member.id !== memberId));
 
     setProjects((prev) =>
       prev.map((project) => ({
@@ -1597,27 +1541,34 @@ export default function Page() {
   const selectedNextDue = selectedProject ? getNextDueStep(selectedProject) : null;
   const selectedOverdueCount = selectedProject ? getOverdueCount(selectedProject) : 0;
 
+  async function handleLogout() {
+    console.log("[1] clicked");
+    const supabase = getSupabaseBrowserClient();
+    console.log("[2] before signOut");
+    try {
+      await supabase.auth.signOut();
+    } catch (e) {
+      console.error(e);
+    }
+    console.log("[3] after signOut");
+    localStorage.removeItem("flowchart-dashboard-v4");
+    try {
+      sessionStorage.clear();
+    } catch {
+      /* ignore */
+    }
+    console.log("[4] before redirect");
+    window.location.href = "/login";
+    console.log("[5] after redirect code reached");
+  }
+
   return (
     <div className="min-h-screen bg-[#f6f5f3] text-neutral-900">
       <div className="mx-auto flex max-w-[1880px] gap-4 px-4 py-4">
         <aside className="sticky top-4 z-40 flex h-[calc(100vh-2rem)] w-[340px] shrink-0 flex-col overflow-hidden rounded-[28px] border border-neutral-200 bg-white">
           <div className="pointer-events-auto relative z-50 shrink-0 border-b border-neutral-200 px-5 py-5">
             <div className="mb-2 flex items-center justify-end">
-              <button
-                type="button"
-                onClick={() => {
-                  console.log("🔥 logout clicked");
-                  localStorage.clear();
-                  sessionStorage.clear();
-                  document.cookie.split(";").forEach((c) => {
-                    document.cookie = c
-                      .replace(/^ +/, "")
-                      .replace(/=.*/, "=;expires=" + new Date(0).toUTCString() + ";path=/");
-                  });
-                  window.location.replace("/login?forceLogout=1");
-                }}
-                className="relative z-[60] cursor-pointer rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium text-neutral-600 pointer-events-auto hover:bg-neutral-50"
-              >
+              <button type="button" onClick={() => void handleLogout()} className="relative z-[60] cursor-pointer rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium text-neutral-600 pointer-events-auto hover:bg-neutral-50">
                 로그아웃
               </button>
             </div>
