@@ -24,3 +24,13 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* 폼 컨트롤이 포인터/텍스트 입력을 받도록 명시 (프로젝트 내 다른 규칙·스택킹 이슈 방어) */
+input:not([type="hidden"]):not([disabled]),
+textarea:not([disabled]),
+select:not([disabled]) {
+  pointer-events: auto;
+  touch-action: manipulation;
+  user-select: text;
+  -webkit-user-select: text;
+}

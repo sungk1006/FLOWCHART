@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   buildDueReminderProcessRequest,
@@ -8,6 +9,23 @@ import {
   type DueReminderProcessResponse,
 } from "@/lib/due-reminder-email";
 import { type MentionNotifyResponse } from "@/lib/mention-email";
+import type { RealtimeChannel } from "@supabase/supabase-js";
+
+import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import {
+  FLOWCHART_LEGACY_STORAGE_KEY,
+  FLOWCHART_SELECTED_ID_KEY,
+  getFlowchartShareId,
+  isSupabaseDashboardEnabled,
+} from "@/lib/sync/constants";
+import { ensureBoardMemberForCurrentUser } from "@/app/actions/ensure-board-member";
+import {
+  loadDashboard,
+  rowToMember,
+  rowToProject,
+  syncDashboard,
+  type ProjectRow,
+} from "@/lib/sync/dashboard";
 
 type ProjectStatus = "REVIEW" | "IN PROGRESS" | "HOLD" | "DONE" | "DRAFT";
 type SortOption = "UPDATED_DESC" | "CODE_ASC" | "CODE_DESC" | "PROGRESS_DESC";
@@ -19,6 +37,8 @@ type Member = {
   name: string;
   email: string;
   role: MemberRole;
+  /** Supabase Auth 사용자 id; 없으면 수동 추가 멤버 */
+  userId?: string | null;
 };
 
 type Mention = {
@@ -120,8 +140,6 @@ type PersistedState = {
   globalMembers: Member[];
 };
 
-const STORAGE_KEY = "flowchart-dashboard-v4";
-
 function parsePersistedJson(raw: string): Partial<PersistedState> | null {
   try {
     const v = JSON.parse(raw) as unknown;
@@ -134,16 +152,45 @@ function parsePersistedJson(raw: string): Partial<PersistedState> | null {
 
 function normalizeStoredMembers(raw: unknown): Member[] {
   if (!Array.isArray(raw)) return [];
-  return raw.filter((m): m is Member => {
-    if (!m || typeof m !== "object") return false;
+  const out: Member[] = [];
+  for (const m of raw) {
+    if (!m || typeof m !== "object") continue;
     const o = m as Record<string, unknown>;
-    return (
-      typeof o.id === "string" &&
-      typeof o.name === "string" &&
-      typeof o.email === "string" &&
-      (o.role === "관리자" || o.role === "사용자")
-    );
-  });
+    if (typeof o.id !== "string") continue;
+    const role = o.role;
+    if (role !== "관리자" && role !== "사용자") continue;
+
+    const name = typeof o.name === "string" ? o.name : o.name == null ? "" : String(o.name);
+    const email = typeof o.email === "string" ? o.email : o.email == null ? "" : String(o.email);
+
+    let normalizedUserId: string | null | undefined;
+    if (!Object.prototype.hasOwnProperty.call(o, "userId") && !Object.prototype.hasOwnProperty.call(o, "user_id")) {
+      normalizedUserId = undefined;
+    } else {
+      const rawUid = Object.prototype.hasOwnProperty.call(o, "userId") ? o.userId : o.user_id;
+      if (rawUid === undefined) {
+        normalizedUserId = undefined;
+      } else if (rawUid === null) {
+        normalizedUserId = null;
+      } else if (typeof rawUid === "string") {
+        normalizedUserId = rawUid.length > 0 ? rawUid : null;
+      } else {
+        normalizedUserId = null;
+      }
+    }
+
+    const member: Member = {
+      id: o.id,
+      name,
+      email,
+      role: role as MemberRole,
+    };
+    if (normalizedUserId !== undefined) {
+      member.userId = normalizedUserId;
+    }
+    out.push(member);
+  }
+  return out;
 }
 
 function normalizeStoredProjects(raw: unknown): Project[] {
@@ -431,12 +478,14 @@ function Input({
 }) {
   return (
     <input
-      value={value}
+      value={value ?? ""}
       type={type}
+      autoComplete="off"
+      disabled={false}
       readOnly={readOnly}
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
-      className="w-full bg-transparent text-[14px] text-neutral-900 outline-none placeholder:text-neutral-400 read-only:cursor-default"
+      className="w-full bg-transparent text-[14px] text-neutral-900 outline-none placeholder:text-neutral-400 read-only:cursor-default disabled:opacity-100"
     />
   );
 }
@@ -454,11 +503,14 @@ function TextArea({
 }) {
   return (
     <textarea
-      value={value}
+      value={value ?? ""}
       rows={rows}
+      autoComplete="off"
+      disabled={false}
+      readOnly={false}
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
-      className="w-full resize-none bg-transparent text-[14px] text-neutral-900 outline-none placeholder:text-neutral-400"
+      className="w-full resize-none bg-transparent text-[14px] text-neutral-900 outline-none placeholder:text-neutral-400 disabled:opacity-100"
     />
   );
 }
@@ -474,7 +526,7 @@ function Select({
 }) {
   return (
     <select
-      value={value}
+      value={value ?? ""}
       onChange={(e) => onChange(e.target.value)}
       className="w-full bg-transparent text-[14px] text-neutral-900 outline-none"
     >
@@ -562,11 +614,40 @@ function applyDueReminderJobResults(prev: Project[], results: DueReminderJobResu
   });
 }
 
+function dashboardDataFingerprint(members: Member[], projects: Project[]): string {
+  const m = [...members].sort((a, b) => a.id.localeCompare(b.id));
+  const p = [...projects].sort((a, b) => a.id.localeCompare(b.id));
+  return JSON.stringify({ members: m, projects: p });
+}
+
+/** 디버그: true면 fingerprint 같아도 setState 적용(평소 false 유지) */
+const DEBUG_REALTIME_DISABLE_FINGERPRINT_SKIP = false;
+
+/** public.projects / public.members 의 share_id(uuid) 와 Realtime filter 호환 여부 */
+const SHARE_ID_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function realtimePayloadShareId(payload: {
+  new?: { share_id?: string };
+  old?: { share_id?: string };
+}): string | undefined {
+  return payload.new?.share_id ?? payload.old?.share_id;
+}
+
+function realtimeEventMatchesShare(
+  payload: { new?: { share_id?: string }; old?: { share_id?: string } },
+  shareId: string
+): boolean {
+  return realtimePayloadShareId(payload) === shareId;
+}
+
 export default function Page() {
+  const router = useRouter();
   const [projects, setProjects] = useState<Project[]>(initialProjects);
   const [selectedId, setSelectedId] = useState<string>(initialProjects[0]?.id ?? "");
 
   const [globalMembers, setGlobalMembers] = useState<Member[]>([]);
+  const [authUserId, setAuthUserId] = useState<string | null>(null);
   const [memberPanelOpen, setMemberPanelOpen] = useState(false);
 
   const [panelOpen, setPanelOpen] = useState(false);
@@ -591,65 +672,355 @@ export default function Page() {
   const [commentOpenMap, setCommentOpenMap] = useState<Record<string, boolean>>({});
   const [savingCommentStepId, setSavingCommentStepId] = useState<string | null>(null);
   const [dueReminderBusy, setDueReminderBusy] = useState(false);
-  /** localStorage에서 첫 복원이 끝나기 전에는 저장하지 않음(초기 상태로 덮어쓰기 방지) */
+  /** 첫 로드(Supabase 또는 레거시 localStorage) 완료 전에는 저장하지 않음 */
   const [storageReady, setStorageReady] = useState(false);
+  const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const realtimeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastRemoteFingerprintRef = useRef<string>("");
+  const realtimeChannelRef = useRef<RealtimeChannel | null>(null);
+
+  const subscriptionShareId =
+    storageReady && isSupabaseDashboardEnabled() ? getFlowchartShareId()?.trim() || null : null;
 
   useEffect(() => {
     let cancelled = false;
+    const sb = getSupabaseBrowserClient();
 
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-
-      const parsed = parsePersistedJson(raw);
-      if (!parsed) return;
-
-      const members = normalizeStoredMembers(parsed.globalMembers);
-      const memberIds = new Set(members.map((m) => m.id));
-
-      if (Array.isArray(parsed.projects)) {
-        const restored = normalizeStoredProjects(parsed.projects);
-        const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
-        if (!cancelled) {
-          setGlobalMembers(members);
-          setProjects(next);
-          const ids = new Set(next.map((p) => p.id));
-          const rawSid = parsed.selectedId;
-          const sid =
-            next.length === 0
-              ? ""
-              : typeof rawSid === "string" && ids.has(rawSid)
-                ? rawSid
-                : (next[0]?.id ?? "");
-          setSelectedId(sid);
-        }
-      } else if (!cancelled) {
-        setGlobalMembers(members);
+    async function applyDashboardFromRemote(shareId: string) {
+      const ensured = await ensureBoardMemberForCurrentUser(shareId);
+      if (!ensured.ok) {
+        console.error("[flowchart] ensureBoardMemberForCurrentUser failed", ensured);
       }
-    } catch {
-      // 손상된 JSON 등 — 초기 상태 유지
-    } finally {
-      if (!cancelled) setStorageReady(true);
+      const data = await loadDashboard(shareId);
+      if (cancelled) return;
+
+      console.log("[DEBUG] loadDashboard raw members", data.members);
+      const beforeNormalize = data.members.map((row) => rowToMember(row));
+      console.log("[DEBUG] before normalize", beforeNormalize);
+      const members = normalizeStoredMembers(beforeNormalize);
+      console.log("[DEBUG] after normalize", members);
+      const memberIds = new Set(members.map((m) => m.id));
+      const restored = normalizeStoredProjects(
+        data.projects.map((row) => projectFromStorage(rowToProject(row as ProjectRow)))
+      );
+      const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
+      const finalProjects = next.length > 0 ? next : initialProjects;
+
+      setGlobalMembers(members);
+      setProjects(finalProjects);
+
+      const ids = new Set(finalProjects.map((p) => p.id));
+      let rawSid: string | null = null;
+      try {
+        rawSid = localStorage.getItem(FLOWCHART_SELECTED_ID_KEY);
+      } catch {
+        /* ignore */
+      }
+      const sid =
+        finalProjects.length === 0
+          ? ""
+          : typeof rawSid === "string" && ids.has(rawSid)
+            ? rawSid
+            : (finalProjects[0]?.id ?? "");
+      setSelectedId(sid);
     }
+
+    const {
+      data: { subscription },
+    } = sb.auth.onAuthStateChange(async (_event, session) => {
+      if (cancelled) return;
+      setAuthUserId(session?.user?.id ?? null);
+      if (!isSupabaseDashboardEnabled() || !session?.user) return;
+      const shareIdFromAuth = getFlowchartShareId()?.trim();
+      if (!shareIdFromAuth) return;
+      try {
+        await applyDashboardFromRemote(shareIdFromAuth);
+      } catch (e) {
+        console.error("[flowchart] loadDashboard failed", e);
+      }
+    });
+
+    async function run() {
+      console.log("[DEBUG] isSupabaseDashboardEnabled", isSupabaseDashboardEnabled());
+      if (isSupabaseDashboardEnabled()) {
+        const shareId = getFlowchartShareId()?.trim() ?? "";
+        const {
+          data: { user: initialUser },
+        } = await sb.auth.getUser();
+        if (!cancelled) setAuthUserId(initialUser?.id ?? null);
+
+        if (!shareId) {
+          if (!cancelled) setStorageReady(true);
+          return;
+        }
+        try {
+          await applyDashboardFromRemote(shareId);
+        } catch (e) {
+          console.error("[flowchart] loadDashboard failed", e);
+        } finally {
+          if (!cancelled) setStorageReady(true);
+        }
+        return;
+      }
+
+      try {
+        const raw = localStorage.getItem(FLOWCHART_LEGACY_STORAGE_KEY);
+        if (!raw) return;
+
+        const parsed = parsePersistedJson(raw);
+        if (!parsed) return;
+
+        const members = normalizeStoredMembers(parsed.globalMembers);
+        const memberIds = new Set(members.map((m) => m.id));
+
+        if (Array.isArray(parsed.projects)) {
+          const restored = normalizeStoredProjects(parsed.projects);
+          const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
+          if (!cancelled) {
+            setGlobalMembers(members);
+            setProjects(next);
+            const ids = new Set(next.map((p) => p.id));
+            const rawSid = parsed.selectedId;
+            const sid =
+              next.length === 0
+                ? ""
+                : typeof rawSid === "string" && ids.has(rawSid)
+                  ? rawSid
+                  : (next[0]?.id ?? "");
+            setSelectedId(sid);
+          }
+        } else if (!cancelled) {
+          setGlobalMembers(members);
+        }
+      } catch {
+        // 손상된 JSON 등 — 초기 상태 유지
+      } finally {
+        if (!cancelled) setStorageReady(true);
+      }
+    }
+
+    void run();
 
     return () => {
       cancelled = true;
+      subscription.unsubscribe();
     };
   }, []);
 
   useEffect(() => {
     if (typeof window === "undefined" || !storageReady) return;
     try {
+      if (isSupabaseDashboardEnabled()) {
+        if (selectedId) {
+          localStorage.setItem(FLOWCHART_SELECTED_ID_KEY, selectedId);
+        } else {
+          localStorage.removeItem(FLOWCHART_SELECTED_ID_KEY);
+        }
+        return;
+      }
       const payload: PersistedState = {
         projects,
         selectedId,
         globalMembers,
       };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+      localStorage.setItem(FLOWCHART_LEGACY_STORAGE_KEY, JSON.stringify(payload));
     } catch {
       // 할당량 초과 등
     }
   }, [projects, selectedId, globalMembers, storageReady]);
+
+  useEffect(() => {
+    if (!isSupabaseDashboardEnabled() || !storageReady) return;
+    const shareId = getFlowchartShareId();
+    if (!shareId) return;
+
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = setTimeout(() => {
+      syncTimerRef.current = null;
+      void syncDashboard(shareId, projects, globalMembers).catch((e) => {
+        console.error("[flowchart] syncDashboard failed", e);
+      });
+    }, 800);
+
+    return () => {
+      if (syncTimerRef.current) {
+        clearTimeout(syncTimerRef.current);
+        syncTimerRef.current = null;
+      }
+    };
+  }, [projects, globalMembers, storageReady]);
+
+  useEffect(() => {
+    function teardownRealtimeChannel() {
+      if (realtimeDebounceRef.current) {
+        clearTimeout(realtimeDebounceRef.current);
+        realtimeDebounceRef.current = null;
+      }
+      const ch = realtimeChannelRef.current;
+      if (!ch) return;
+      try {
+        void getSupabaseBrowserClient().removeChannel(ch);
+      } catch {
+        /* 클라이언트 미구성 시 무시 */
+      }
+      realtimeChannelRef.current = null;
+    }
+
+    if (!subscriptionShareId) {
+      teardownRealtimeChannel();
+      return;
+    }
+
+    const sb = getSupabaseBrowserClient();
+    const shareIdLocked: string = subscriptionShareId;
+
+    teardownRealtimeChannel();
+
+    async function applyRemoteDashboard() {
+      console.log("[flowchart] loadDashboard start", { shareId: shareIdLocked });
+      try {
+        const data = await loadDashboard(shareIdLocked);
+        console.log("[flowchart] loadDashboard finish", {
+          shareId: shareIdLocked,
+          memberRows: data.members.length,
+          projectRows: data.projects.length,
+        });
+
+        const members = normalizeStoredMembers(data.members.map((row) => rowToMember(row)));
+        const memberIds = new Set(members.map((m) => m.id));
+        const restored = normalizeStoredProjects(
+          data.projects.map((row) => projectFromStorage(rowToProject(row as ProjectRow)))
+        );
+        const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
+        const finalProjects = next.length > 0 ? next : initialProjects;
+
+        const fp = dashboardDataFingerprint(members, finalProjects);
+        const fpSame = fp === lastRemoteFingerprintRef.current;
+        if (fpSame) {
+          console.log("[flowchart] dashboardDataFingerprint: same as last applied", { shareId: shareIdLocked });
+        } else {
+          console.log("[flowchart] dashboardDataFingerprint: changed", { shareId: shareIdLocked });
+        }
+
+        if (fpSame && !DEBUG_REALTIME_DISABLE_FINGERPRINT_SKIP) {
+          console.log("[flowchart] applyRemote early return (fingerprint unchanged)", { shareId: shareIdLocked });
+          return;
+        }
+
+        lastRemoteFingerprintRef.current = fp;
+
+        console.log("[flowchart] applyRemote applying setState", {
+          shareId: shareIdLocked,
+          members: members.length,
+          projects: finalProjects.length,
+        });
+
+        setGlobalMembers(members);
+        setProjects(finalProjects);
+        setSelectedId((prev) => {
+          const ids = new Set(finalProjects.map((p) => p.id));
+          if (ids.has(prev)) {
+            console.log("[flowchart] setSelectedId keep prev", { shareId: shareIdLocked, prev });
+            return prev;
+          }
+          let rawSid: string | null = null;
+          try {
+            rawSid = localStorage.getItem(FLOWCHART_SELECTED_ID_KEY);
+          } catch {
+            /* ignore */
+          }
+          if (finalProjects.length === 0) {
+            console.log("[flowchart] setSelectedId clear (no projects)", { shareId: shareIdLocked });
+            return "";
+          }
+          if (typeof rawSid === "string" && ids.has(rawSid)) {
+            console.log("[flowchart] setSelectedId from localStorage", { shareId: shareIdLocked, rawSid });
+            return rawSid;
+          }
+          const first = finalProjects[0]?.id ?? "";
+          console.log("[flowchart] setSelectedId fallback first project", { shareId: shareIdLocked, first });
+          return first;
+        });
+      } catch (e) {
+        console.error("[flowchart] realtime reload failed", e);
+      }
+    }
+
+    function scheduleRemoteReload(source: string) {
+      console.log("[flowchart] scheduleRemoteReload", { shareId: shareIdLocked, source });
+      if (realtimeDebounceRef.current) clearTimeout(realtimeDebounceRef.current);
+      realtimeDebounceRef.current = setTimeout(() => {
+        realtimeDebounceRef.current = null;
+        void applyRemoteDashboard();
+      }, 400);
+    }
+
+    const useServerFilter = SHARE_ID_UUID_RE.test(shareIdLocked);
+    if (!useServerFilter) {
+      console.warn(
+        "[flowchart] realtime: shareId is not a UUID string. DB column share_id is uuid — use `?shareId=<uuid>` (same as NEXT_PUBLIC_FLOWCHART_SHARE_ID) or Realtime filter `share_id=eq....` will not match rows; sync writes may also fail."
+      );
+    }
+
+    function onPostgresChange(table: "projects" | "members") {
+      return (payload: {
+        eventType?: string;
+        new?: { share_id?: string };
+        old?: { share_id?: string };
+      }) => {
+        const shareFromPayload = realtimePayloadShareId(payload);
+        console.log("[flowchart] postgres_changes received", {
+          shareId: shareIdLocked,
+          table,
+          eventType: payload.eventType,
+          share_id: shareFromPayload,
+          expectedShareId: shareIdLocked,
+          useServerFilter,
+        });
+        if (!useServerFilter && !realtimeEventMatchesShare(payload, shareIdLocked)) {
+          console.log("[flowchart] postgres_changes ignored (client share filter)", { shareId: shareIdLocked, table });
+          return;
+        }
+        scheduleRemoteReload(`${table}:${payload.eventType ?? "?"}`);
+      };
+    }
+
+    const channelTopic = `dashboard-realtime-${shareIdLocked}`;
+    const channel = sb.channel(channelTopic);
+    if (useServerFilter) {
+      const filter = `share_id=eq.${shareIdLocked}`;
+      channel
+        .on("postgres_changes", { event: "*", schema: "public", table: "projects", filter }, onPostgresChange("projects"))
+        .on("postgres_changes", { event: "*", schema: "public", table: "members", filter }, onPostgresChange("members"));
+    } else {
+      channel
+        .on("postgres_changes", { event: "*", schema: "public", table: "projects" }, onPostgresChange("projects"))
+        .on("postgres_changes", { event: "*", schema: "public", table: "members" }, onPostgresChange("members"));
+    }
+
+    channel.subscribe((status, err) => {
+      console.log("[flowchart] realtime subscription status:", {
+        shareId: shareIdLocked,
+        status,
+        err: err?.message ?? null,
+        channelTopic,
+      });
+      if (status === "SUBSCRIBED") {
+        console.log("[flowchart] realtime SUBSCRIBED", {
+          shareId: shareIdLocked,
+          tables: ["projects", "members"],
+          serverSideShareFilter: useServerFilter,
+          DEBUG_REALTIME_DISABLE_FINGERPRINT_SKIP,
+        });
+      }
+    });
+
+    realtimeChannelRef.current = channel;
+
+    return () => {
+      teardownRealtimeChannel();
+    };
+  }, [subscriptionShareId]);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedId) ?? projects[0] ?? null,
@@ -734,8 +1105,13 @@ export default function Page() {
     setFormMode("create");
     setEditingId(null);
     setForm({
-      ...emptyForm(),
       code: "DRAFT",
+      status: "DRAFT",
+      country: "",
+      exporter: "",
+      item: "GREEN BEAN",
+      client: "",
+      note: "",
     });
     setPanelOpen(true);
   }
@@ -744,13 +1120,13 @@ export default function Page() {
     setFormMode("edit");
     setEditingId(project.id);
     setForm({
-      code: project.code,
+      code: project.code || "",
       status: project.status,
-      country: project.country,
-      exporter: project.exporter,
-      item: project.item,
-      client: project.client,
-      note: project.note,
+      country: project.country || "",
+      exporter: project.exporter || "",
+      item: project.item || "GREEN BEAN",
+      client: project.client || "",
+      note: project.note || "",
     });
     setPanelOpen(true);
   }
@@ -931,7 +1307,19 @@ export default function Page() {
   }
 
   function removeGlobalMember(memberId: string) {
-    setGlobalMembers((prev) => prev.filter((member) => member.id !== memberId));
+    let blocked = false;
+    setGlobalMembers((prev) => {
+      const target = prev.find((m) => m.id === memberId);
+      if (target?.userId) {
+        blocked = true;
+        return prev;
+      }
+      return prev.filter((member) => member.id !== memberId);
+    });
+    if (blocked) {
+      alert("계정과 연결된 멤버는 목록에서 삭제할 수 없습니다.");
+      return;
+    }
 
     setProjects((prev) =>
       prev.map((project) => ({
@@ -1205,18 +1593,39 @@ export default function Page() {
   const selectedNextDue = selectedProject ? getNextDueStep(selectedProject) : null;
   const selectedOverdueCount = selectedProject ? getOverdueCount(selectedProject) : 0;
 
+  async function handleLogout() {
+    try {
+      const supabase = getSupabaseBrowserClient();
+      await supabase.auth.signOut();
+    } catch {
+      /* noop */
+    }
+    router.push("/login");
+    router.refresh();
+  }
+
   return (
     <div className="min-h-screen bg-[#f6f5f3] text-neutral-900">
       <div className="mx-auto flex max-w-[1880px] gap-4 px-4 py-4">
-        <aside className="sticky top-4 h-[calc(100vh-2rem)] w-[340px] shrink-0 overflow-hidden rounded-[28px] border border-neutral-200 bg-white">
-          <div className="border-b border-neutral-200 px-5 py-5">
+        <aside className="sticky top-4 z-40 flex h-[calc(100vh-2rem)] w-[340px] shrink-0 flex-col overflow-hidden rounded-[28px] border border-neutral-200 bg-white">
+          <div className="pointer-events-auto relative z-50 shrink-0 border-b border-neutral-200 px-5 py-5">
+            <div className="mb-2 flex items-center justify-end">
+              <button
+                type="button"
+                onClick={() => void handleLogout()}
+                className="relative z-[60] cursor-pointer rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium text-neutral-600 pointer-events-auto hover:bg-neutral-50"
+              >
+                로그아웃
+              </button>
+            </div>
             <div className="mb-1 text-[11px] uppercase tracking-[0.22em] text-neutral-500">Dashboard</div>
             <div className="text-[30px] font-black tracking-[-0.05em]">FLOWCHART TEST</div>
             <div className="mt-2 text-sm text-neutral-500">코드 중심 리스트 + 고정 15단계 플로우</div>
           </div>
 
-          <div className="border-b border-neutral-200 px-4 py-4">
+          <div className="min-h-0 flex-1 overflow-y-auto border-b border-neutral-200 px-4 py-4">
             <button
+              type="button"
               onClick={() => setMemberPanelOpen((prev) => !prev)}
               className="mb-3 w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm font-semibold"
             >
@@ -1224,7 +1633,7 @@ export default function Page() {
             </button>
 
             {memberPanelOpen && (
-              <div className="mb-3 overflow-hidden rounded-[22px] border border-neutral-200 bg-[#f8f7f5]">
+              <div className="relative z-0 mb-3 rounded-[22px] border border-neutral-200 bg-[#f8f7f5]">
                 <div className="border-b border-neutral-200 px-3 py-3 text-sm font-semibold">Global Members</div>
 
                 <div className="max-h-[38vh] space-y-3 overflow-y-auto p-3">
@@ -1273,14 +1682,28 @@ export default function Page() {
                           <div className="min-w-0 flex items-center gap-3">
                             <MemberInitial name={member.name} />
                             <div className="min-w-0">
-                              <div className="truncate text-sm font-semibold">{member.name}</div>
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="truncate text-sm font-semibold">{member.name}</span>
+                                {member.userId ? (
+                                  <span className="shrink-0 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">
+                                    연결됨
+                                  </span>
+                                ) : null}
+                                {member.userId && authUserId && member.userId === authUserId ? (
+                                  <span className="shrink-0 rounded-md bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800">
+                                    나
+                                  </span>
+                                ) : null}
+                              </div>
                               <div className="truncate text-xs text-neutral-500">{member.email}</div>
                             </div>
                           </div>
 
                           <button
+                            type="button"
                             onClick={() => removeGlobalMember(member.id)}
-                            className="rounded-xl border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700"
+                            disabled={Boolean(member.userId)}
+                            className="rounded-xl border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
                           >
                             삭제
                           </button>
@@ -1293,6 +1716,7 @@ export default function Page() {
             )}
 
             <button
+              type="button"
               onClick={openCreatePanel}
               className="mb-3 w-full rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white"
             >
@@ -1300,12 +1724,13 @@ export default function Page() {
             </button>
 
             {panelOpen && (
-              <div className="mb-3 overflow-hidden rounded-[22px] border border-neutral-200 bg-[#f8f7f5]">
+              <div className="relative z-10 mb-3 rounded-[22px] border border-neutral-200 bg-[#f8f7f5]">
                 <div className="flex items-center justify-between border-b border-neutral-200 px-3 py-3">
                   <div className="text-sm font-semibold">
                     {formMode === "create" ? "Create Project" : "Edit Project"}
                   </div>
                   <button
+                    type="button"
                     onClick={() => {
                       setPanelOpen(false);
                       setEditingId(null);
@@ -1320,52 +1745,56 @@ export default function Page() {
                 <div className="max-h-[55vh] space-y-3 overflow-y-auto p-3">
                   <Field label="CODE">
                     <Input
-                      value={form.code}
-                      onChange={(v) => updateFormField("code", v)}
+                      value={form.code || ""}
+                      onChange={(v) => setForm((prev) => ({ ...prev, code: v }))}
                       placeholder="예: DRAFT 또는 TATAMA-84"
                     />
                   </Field>
 
                   <Field label="STATUS">
                     <Select
-                      value={form.status}
-                      onChange={(v) => updateFormField("status", v as ProjectStatus)}
+                      value={form.status || "DRAFT"}
+                      onChange={(v) => setForm((prev) => ({ ...prev, status: v as ProjectStatus }))}
                       options={["DRAFT", "REVIEW", "IN PROGRESS", "HOLD", "DONE"]}
                     />
                   </Field>
 
                   <Field label="COUNTRY">
                     <Input
-                      value={form.country}
-                      onChange={(v) => updateFormField("country", v)}
+                      value={form.country || ""}
+                      onChange={(v) => setForm((prev) => ({ ...prev, country: v }))}
                       placeholder="COUNTRY"
                     />
                   </Field>
 
                   <Field label="EXPORTER">
                     <Input
-                      value={form.exporter}
-                      onChange={(v) => updateFormField("exporter", v)}
+                      value={form.exporter || ""}
+                      onChange={(v) => setForm((prev) => ({ ...prev, exporter: v }))}
                       placeholder="EXPORTER"
                     />
                   </Field>
 
                   <Field label="ITEM">
-                    <Select value={form.item} onChange={(v) => updateFormField("item", v)} options={ITEM_OPTIONS} />
+                    <Select
+                      value={form.item || "GREEN BEAN"}
+                      onChange={(v) => setForm((prev) => ({ ...prev, item: v }))}
+                      options={ITEM_OPTIONS}
+                    />
                   </Field>
 
                   <Field label="CLIENT">
                     <Input
-                      value={form.client}
-                      onChange={(v) => updateFormField("client", v)}
+                      value={form.client || ""}
+                      onChange={(v) => setForm((prev) => ({ ...prev, client: v }))}
                       placeholder="CLIENT"
                     />
                   </Field>
 
                   <Field label="NOTE">
                     <TextArea
-                      value={form.note}
-                      onChange={(v) => updateFormField("note", v)}
+                      value={form.note || ""}
+                      onChange={(v) => setForm((prev) => ({ ...prev, note: v }))}
                       placeholder="NOTE"
                       rows={4}
                     />
@@ -1443,7 +1872,7 @@ export default function Page() {
             )}
           </div>
 
-          <div className="max-h-[calc(100vh-20rem)] overflow-y-auto px-3 py-3">
+          <div className="max-h-[38vh] shrink-0 overflow-y-auto border-t border-neutral-200 px-3 py-3">
             <div className="mb-3 flex items-center justify-between px-2">
               <div className="text-sm font-semibold text-neutral-700">Projects</div>
               <div className="text-xs text-neutral-500">{filteredProjects.length}</div>
@@ -1511,7 +1940,7 @@ export default function Page() {
           </div>
         </aside>
 
-        <main className="min-w-0 flex-1">
+        <main className="relative z-0 min-w-0 flex-1">
           {selectedProject ? (
             <>
               <section className="mb-4 rounded-[26px] border border-neutral-200 bg-white px-5 py-4">
