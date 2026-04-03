@@ -12,9 +12,10 @@ import type { RealtimeChannel } from "@supabase/supabase-js";
 
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { FLOWCHART_LEGACY_STORAGE_KEY, getFlowchartShareId, isSupabaseDashboardEnabled } from "@/lib/sync/constants";
+import { deleteBoardMemberAsAdmin } from "@/app/actions/delete-board-member";
 import { ensureBoardMemberForCurrentUser } from "@/app/actions/ensure-board-member";
 import { touchBoardMemberHeartbeat } from "@/app/actions/heartbeat-board-member";
-import { deleteManualBoardMember, insertManualBoardMember } from "@/app/actions/manual-board-member";
+import { isBoardAdminEmail } from "@/lib/board-admin";
 import { isMemberOnline } from "@/lib/members-online";
 import {
   loadMembersOnly,
@@ -35,7 +36,7 @@ type Member = {
   name: string;
   email: string;
   role: MemberRole;
-  /** Supabase Auth 사용자 id; 없으면 수동 추가 멤버 */
+  /** Supabase Auth 사용자 id */
   userId?: string | null;
   /** members.last_seen_at (DB 동기화 시) */
   lastSeenAt?: string | null;
@@ -141,12 +142,6 @@ type ProjectForm = {
   item: string;
   client: string;
   note: string;
-};
-
-type MemberForm = {
-  name: string;
-  email: string;
-  role: MemberRole;
 };
 
 type PersistedState = {
@@ -277,23 +272,6 @@ function emptyForm(): ProjectForm {
     item: "GREEN BEAN",
     client: "",
     note: "",
-  };
-}
-
-function emptyMemberForm(): MemberForm {
-  return {
-    name: "",
-    email: "",
-    role: "사용자",
-  };
-}
-
-function createMember(name: string, email: string, role: MemberRole): Member {
-  return {
-    id: createId("member"),
-    name,
-    email,
-    role,
   };
 }
 
@@ -662,7 +640,8 @@ export default function Page() {
 
   const [globalMembers, setGlobalMembers] = useState<Member[]>([]);
   const [authUserId, setAuthUserId] = useState<string | null>(null);
-  const [memberPanelOpen, setMemberPanelOpen] = useState(true);
+  const [authUserEmail, setAuthUserEmail] = useState<string | null>(null);
+  const [memberPanelOpen, setMemberPanelOpen] = useState(false);
 
   const [panelOpen, setPanelOpen] = useState(false);
   const [filterOpen, setFilterOpen] = useState(false);
@@ -670,8 +649,6 @@ export default function Page() {
   const [formMode, setFormMode] = useState<FormMode>("create");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState<ProjectForm>(emptyForm());
-
-  const [memberForm, setMemberForm] = useState<MemberForm>(emptyMemberForm());
 
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("ALL");
@@ -699,6 +676,17 @@ export default function Page() {
   const supabaseProjectsBootstrappedRef = useRef(false);
   const realtimeMembersDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const canDeleteMembers = useMemo(() => {
+    if (isBoardAdminEmail(authUserEmail)) return true;
+    if (
+      authUserId &&
+      globalMembers.some((m) => m.userId === authUserId && m.role === "관리자")
+    ) {
+      return true;
+    }
+    return false;
+  }, [authUserEmail, authUserId, globalMembers]);
+
   const refreshMembersFromServer = useCallback(async () => {
     if (!isSupabaseDashboardEnabled() || !getFlowchartShareId()?.trim()) return;
     try {
@@ -723,6 +711,7 @@ export default function Page() {
     void sb.auth.getUser().then(({ data: { user } }) => {
       if (cancelled) return;
       setAuthUserId(user?.id ?? null);
+      setAuthUserEmail(user?.email ?? null);
       if (!user) {
         window.location.href = "/login";
       }
@@ -732,6 +721,7 @@ export default function Page() {
       data: { subscription },
     } = sb.auth.onAuthStateChange((_event, session) => {
       setAuthUserId(session?.user?.id ?? null);
+      setAuthUserEmail(session?.user?.email ?? null);
       if (!session?.user) {
         window.location.href = "/login";
       }
@@ -1151,10 +1141,6 @@ export default function Page() {
     setForm((prev) => ({ ...prev, [key]: value }));
   }
 
-  function updateMemberFormField<K extends keyof MemberForm>(key: K, value: MemberForm[K]) {
-    setMemberForm((prev) => ({ ...prev, [key]: value }));
-  }
-
   function openCreatePanel() {
     setFormMode("create");
     setEditingId(null);
@@ -1336,50 +1322,22 @@ export default function Page() {
     );
   }
 
-  async function addGlobalMember() {
-    const name = memberForm.name.trim();
-    const email = memberForm.email.trim();
-
-    if (!name) {
-      alert("멤버 이름을 입력해주세요.");
-      return;
-    }
-
-    if (!email) {
-      alert("멤버 이메일을 입력해주세요.");
-      return;
-    }
-
-    const duplicate = globalMembers.some((member) => member.email.toLowerCase() === email.toLowerCase());
-    if (duplicate) {
-      alert("이미 같은 이메일의 멤버가 있습니다.");
-      return;
-    }
-
-    if (isSupabaseDashboardEnabled() && getFlowchartShareId()) {
-      const res = await insertManualBoardMember({ name, email, role: memberForm.role });
-      if (!res.ok) {
-        alert(res.message ?? "멤버 추가에 실패했습니다.");
-        return;
-      }
-      await refreshMembersFromServer();
-      setMemberForm(emptyMemberForm());
-      return;
-    }
-
-    setGlobalMembers([...globalMembers, createMember(name, email, memberForm.role)]);
-    setMemberForm(emptyMemberForm());
-  }
-
   async function removeGlobalMember(memberId: string) {
     const target = globalMembers.find((m) => m.id === memberId);
-    if (target?.userId) {
-      alert("계정과 연결된 멤버는 목록에서 삭제할 수 없습니다.");
+    if (!target) return;
+
+    if (authUserId && target.userId && target.userId === authUserId) {
+      alert("본인 계정은 삭제할 수 없습니다.");
+      return;
+    }
+
+    if (!canDeleteMembers) {
+      alert("관리자만 멤버를 삭제할 수 있습니다.");
       return;
     }
 
     if (isSupabaseDashboardEnabled() && getFlowchartShareId()) {
-      const res = await deleteManualBoardMember(memberId);
+      const res = await deleteBoardMemberAsAdmin(memberId);
       if (!res.ok) {
         alert(res.message ?? "삭제에 실패했습니다.");
         return;
@@ -1709,7 +1667,7 @@ export default function Page() {
             {memberPanelOpen && (
               <div className="relative z-0 mb-3 rounded-[22px] border border-neutral-200 bg-[#f8f7f5]">
                 <div className="flex items-center justify-between border-b border-neutral-200 px-3 py-3">
-                  <div className="text-sm font-semibold">Global Members</div>
+                  <div className="text-sm font-semibold">Members</div>
                   <div className="text-xs text-neutral-500">{globalMembers.length}명</div>
                 </div>
 
@@ -1717,7 +1675,7 @@ export default function Page() {
                   <div className="space-y-2">
                     {globalMembers.length === 0 ? (
                       <div className="rounded-2xl border border-dashed border-neutral-200 bg-white px-4 py-5 text-center text-sm text-neutral-400">
-                        등록된 전역 멤버가 없습니다.
+                        등록된 멤버가 없습니다.
                       </div>
                     ) : (
                       globalMembers.map((member) => (
@@ -1748,7 +1706,10 @@ export default function Page() {
                           <button
                             type="button"
                             onClick={() => void removeGlobalMember(member.id)}
-                            disabled={Boolean(member.userId)}
+                            disabled={
+                              !canDeleteMembers ||
+                              Boolean(authUserId && member.userId && member.userId === authUserId)
+                            }
                             className="rounded-xl border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
                           >
                             삭제
@@ -1756,41 +1717,6 @@ export default function Page() {
                         </div>
                       ))
                     )}
-                  </div>
-
-                  <div className="space-y-3 border-t border-neutral-200 pt-3">
-                    <div className="text-[11px] font-medium uppercase tracking-wide text-neutral-500">멤버 추가</div>
-                    <Field label="NAME">
-                      <Input
-                        value={memberForm.name}
-                        onChange={(v) => updateMemberFormField("name", v)}
-                        placeholder="멤버 이름"
-                      />
-                    </Field>
-
-                    <Field label="EMAIL">
-                      <Input
-                        value={memberForm.email}
-                        onChange={(v) => updateMemberFormField("email", v)}
-                        placeholder="example@email.com"
-                      />
-                    </Field>
-
-                    <Field label="ROLE">
-                      <Select
-                        value={memberForm.role}
-                        onChange={(v) => updateMemberFormField("role", v as MemberRole)}
-                        options={["관리자", "사용자"]}
-                      />
-                    </Field>
-
-                    <button
-                      type="button"
-                      onClick={() => void addGlobalMember()}
-                      className="w-full rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white"
-                    >
-                      + Add Member
-                    </button>
                   </div>
                 </div>
               </div>

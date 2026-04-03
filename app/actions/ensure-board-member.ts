@@ -1,6 +1,7 @@
 "use server";
 
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import { roleForBoardMemberEmail } from "@/lib/board-admin";
 
 export type EnsureBoardMemberResult =
   | { ok: true; created: boolean; linked?: boolean; updated?: boolean }
@@ -8,9 +9,9 @@ export type EnsureBoardMemberResult =
 
 /**
  * 현재 세션 사용자를 해당 share 보드 members에 반영합니다.
- * - (share_id, user_id)가 이미 있으면 name/email/last_seen_at만 갱신
+ * - (share_id, user_id)가 이미 있으면 name/email/role(관리자 이메일)/last_seen_at 갱신
  * - 같은 이메일의 수동 멤버(user_id null)가 있으면 연결 후 갱신
- * - 없으면 새 행 생성
+ * - 없으면 새 행 생성 (sungkyung@elcafetal.co.kr → role 관리자)
  */
 export async function ensureBoardMemberForCurrentUser(): Promise<EnsureBoardMemberResult> {
   const shareId = process.env.NEXT_PUBLIC_FLOWCHART_SHARE_ID?.trim();
@@ -50,6 +51,7 @@ export async function ensureBoardMemberForCurrentUser(): Promise<EnsureBoardMemb
     "Member";
 
   const nowIso = new Date().toISOString();
+  const role = roleForBoardMemberEmail(email);
 
   const { data: existing, error: selErr } = await supabase
     .from("members")
@@ -68,6 +70,7 @@ export async function ensureBoardMemberForCurrentUser(): Promise<EnsureBoardMemb
       .update({
         name: displayName,
         email,
+        role,
         last_seen_at: nowIso,
       })
       .eq("id", existing.id);
@@ -99,6 +102,7 @@ export async function ensureBoardMemberForCurrentUser(): Promise<EnsureBoardMemb
           user_id: uid,
           name: displayName,
           email,
+          role,
           last_seen_at: nowIso,
         })
         .eq("id", manual.id);
@@ -118,7 +122,7 @@ export async function ensureBoardMemberForCurrentUser(): Promise<EnsureBoardMemb
     share_id: shareId,
     name: displayName,
     email,
-    role: "사용자",
+    role,
     user_id: uid,
     last_seen_at: nowIso,
   });

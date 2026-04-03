@@ -4,6 +4,7 @@ import { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { ensureBoardMemberForCurrentUser } from "@/app/actions/ensure-board-member";
+import { roleForBoardMemberEmail } from "@/lib/board-admin";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { FLOWCHART_LEGACY_STORAGE_KEY } from "@/lib/sync/constants";
 
@@ -50,7 +51,7 @@ async function syncCurrentUserIntoLegacyGlobalMembers(
       return false;
     });
     if (dup) return;
-    list.push({ id, name: displayName, email, role: "사용자", userId: uid });
+    list.push({ id, name: displayName, email, role: roleForBoardMemberEmail(email), userId: uid });
     base.globalMembers = list;
     localStorage.setItem(FLOWCHART_LEGACY_STORAGE_KEY, JSON.stringify(base));
   } catch {
@@ -77,18 +78,27 @@ function LoginForm() {
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [passwordConfirm, setPasswordConfirm] = useState("");
   const [mode, setMode] = useState<"login" | "signup">("login");
   const [message, setMessage] = useState<string | null>(
     urlError === "auth" ? "인증에 실패했습니다. 다시 시도해 주세요." : null
   );
   const [loading, setLoading] = useState(false);
 
+  const passwordMismatchMessage = "비밀번호가 일치하지 않습니다.";
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setLoading(true);
     setMessage(null);
-    const supabase = getSupabaseBrowserClient();
     const emailTrimmed = email.trim();
+    if (mode === "signup") {
+      if (password !== passwordConfirm) {
+        setMessage(passwordMismatchMessage);
+        return;
+      }
+    }
+    setLoading(true);
+    const supabase = getSupabaseBrowserClient();
     try {
       if (mode === "signup") {
         const localPart = emailTrimmed.includes("@") ? emailTrimmed.split("@")[0]! : emailTrimmed;
@@ -146,7 +156,10 @@ function LoginForm() {
         <div className="mt-6 flex rounded-2xl border border-neutral-200 p-1">
           <button
             type="button"
-            onClick={() => setMode("login")}
+            onClick={() => {
+              setMode("login");
+              setPasswordConfirm("");
+            }}
             className={`flex-1 rounded-xl py-2 text-sm font-semibold ${
               mode === "login" ? "bg-slate-900 text-white" : "text-neutral-600"
             }`}
@@ -189,13 +202,55 @@ function LoginForm() {
               type="password"
               autoComplete={mode === "signup" ? "new-password" : "current-password"}
               required
-              minLength={6}
               value={password}
-              onChange={(e) => setPassword(e.target.value)}
+              onChange={(e) => {
+                const v = e.target.value;
+                setPassword(v);
+                if (
+                  mode === "signup" &&
+                  message === passwordMismatchMessage &&
+                  v === passwordConfirm
+                ) {
+                  setMessage(null);
+                }
+              }}
               className="w-full rounded-xl border border-neutral-200 px-4 py-3 text-sm outline-none focus:border-neutral-400"
-              placeholder="6자 이상"
+              placeholder="비밀번호"
             />
           </div>
+
+          {mode === "signup" ? (
+            <div>
+              <label
+                htmlFor="passwordConfirm"
+                className="mb-1 block text-xs font-medium uppercase tracking-wide text-neutral-500"
+              >
+                비밀번호 확인
+              </label>
+              <input
+                id="passwordConfirm"
+                type="password"
+                autoComplete="new-password"
+                value={passwordConfirm}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setPasswordConfirm(v);
+                  if (
+                    mode === "signup" &&
+                    message === passwordMismatchMessage &&
+                    password === v
+                  ) {
+                    setMessage(null);
+                  }
+                }}
+                className="w-full rounded-xl border border-neutral-200 px-4 py-3 text-sm outline-none focus:border-neutral-400"
+                placeholder="비밀번호 다시 입력"
+              />
+              {passwordConfirm.length > 0 && password !== passwordConfirm ? (
+                <p className="mt-1.5 text-sm text-rose-600">{passwordMismatchMessage}</p>
+              ) : null}
+            </div>
+          ) : null}
 
           {message ? (
             <p className="rounded-xl bg-neutral-100 px-3 py-2 text-center text-sm text-neutral-700">{message}</p>
@@ -203,7 +258,11 @@ function LoginForm() {
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={
+              loading ||
+              (mode === "signup" &&
+                (!email.trim() || !password || !passwordConfirm || password !== passwordConfirm))
+            }
             className="w-full rounded-2xl bg-slate-900 py-3 text-sm font-semibold text-white disabled:opacity-60"
           >
             {loading ? "처리 중…" : mode === "signup" ? "회원가입" : "로그인"}
