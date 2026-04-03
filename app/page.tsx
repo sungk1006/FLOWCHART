@@ -675,6 +675,8 @@ export default function Page() {
   const localMembersSnapshotRef = useRef<Member[]>([]);
   const supabaseProjectsBootstrappedRef = useRef(false);
   const realtimeMembersDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** 병렬 loadMembersOnly 응답이 늦게 도착해 최신 멤버 목록을 덮어쓰지 않도록 함 */
+  const membersRefreshSeqRef = useRef(0);
 
   const canDeleteMembers = useMemo(() => {
     if (isBoardAdminEmail(authUserEmail)) return true;
@@ -689,8 +691,10 @@ export default function Page() {
 
   const refreshMembersFromServer = useCallback(async () => {
     if (!isSupabaseDashboardEnabled() || !getFlowchartShareId()?.trim()) return;
+    const seq = ++membersRefreshSeqRef.current;
     try {
       const { members } = await loadMembersOnly();
+      if (seq !== membersRefreshSeqRef.current) return;
       const mapped = members.map(mapMemberRowToPageMember);
       setGlobalMembers(mapped);
       localMembersSnapshotRef.current = mapped;
@@ -1688,7 +1692,11 @@ export default function Page() {
                             <div className="min-w-0">
                               <div className="flex flex-wrap items-center gap-1.5">
                                 <span className="truncate text-sm font-semibold">{member.name}</span>
-                                {member.userId && authUserId && member.userId === authUserId ? (
+                                {member.userId &&
+                                authUserId &&
+                                member.userId === authUserId &&
+                                (!authUserEmail?.trim() ||
+                                  member.email.trim().toLowerCase() === authUserEmail.trim().toLowerCase()) ? (
                                   <span className="shrink-0 rounded-md bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800">
                                     나
                                   </span>
