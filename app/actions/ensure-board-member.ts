@@ -3,14 +3,14 @@
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 export type EnsureBoardMemberResult =
-  | { ok: true; created: boolean; linked?: boolean }
+  | { ok: true; created: boolean; linked?: boolean; updated?: boolean }
   | { ok: false; reason: "no_user" | "db_error"; message?: string };
 
 /**
- * 현재 세션 사용자가 해당 share 보드에 members 행이 없으면 생성합니다.
- * 보드는 `NEXT_PUBLIC_FLOWCHART_SHARE_ID`와 동일한 share_id만 사용합니다.
- * 이미 (share_id, user_id) 조합이 있으면 아무 것도 하지 않습니다.
- * 같은 이메일의 수동 멤버가 있으면 해당 row에 user_id를 연결합니다.
+ * 현재 세션 사용자를 해당 share 보드 members에 반영합니다.
+ * - (share_id, user_id)가 이미 있으면 name/email/last_seen_at만 갱신
+ * - 같은 이메일의 수동 멤버(user_id null)가 있으면 연결 후 갱신
+ * - 없으면 새 행 생성
  */
 export async function ensureBoardMemberForCurrentUser(): Promise<EnsureBoardMemberResult> {
   const shareId = process.env.NEXT_PUBLIC_FLOWCHART_SHARE_ID?.trim();
@@ -49,7 +49,8 @@ export async function ensureBoardMemberForCurrentUser(): Promise<EnsureBoardMemb
     (email.includes("@") ? email.split("@")[0]! : email) ||
     "Member";
 
-  // 1) 이미 user_id로 연결된 멤버가 있는지 확인
+  const nowIso = new Date().toISOString();
+
   const { data: existing, error: selErr } = await supabase
     .from("members")
     .select("id")
@@ -62,10 +63,22 @@ export async function ensureBoardMemberForCurrentUser(): Promise<EnsureBoardMemb
   }
 
   if (existing) {
-    return { ok: true, created: false };
+    const { error: updErr } = await supabase
+      .from("members")
+      .update({
+        name: displayName,
+        email,
+        last_seen_at: nowIso,
+      })
+      .eq("id", existing.id);
+
+    if (updErr) {
+      return { ok: false, reason: "db_error", message: updErr.message };
+    }
+
+    return { ok: true, created: false, updated: true };
   }
 
-  // 2) 같은 이메일의 수동 멤버가 있는지 확인
   if (email) {
     const { data: manual, error: manualErr } = await supabase
       .from("members")
@@ -85,6 +98,8 @@ export async function ensureBoardMemberForCurrentUser(): Promise<EnsureBoardMemb
         .update({
           user_id: uid,
           name: displayName,
+          email,
+          last_seen_at: nowIso,
         })
         .eq("id", manual.id);
 
@@ -96,7 +111,6 @@ export async function ensureBoardMemberForCurrentUser(): Promise<EnsureBoardMemb
     }
   }
 
-  // 3) 없으면 새 멤버 생성
   const id = `member-auth-${uid}`;
 
   const { error: insErr } = await supabase.from("members").insert({
@@ -106,6 +120,7 @@ export async function ensureBoardMemberForCurrentUser(): Promise<EnsureBoardMemb
     email,
     role: "사용자",
     user_id: uid,
+    last_seen_at: nowIso,
   });
 
   if (insErr) {

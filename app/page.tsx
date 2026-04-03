@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   buildDueReminderProcessRequest,
@@ -13,10 +13,15 @@ import type { RealtimeChannel } from "@supabase/supabase-js";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { FLOWCHART_LEGACY_STORAGE_KEY, getFlowchartShareId, isSupabaseDashboardEnabled } from "@/lib/sync/constants";
 import { ensureBoardMemberForCurrentUser } from "@/app/actions/ensure-board-member";
+import { touchBoardMemberHeartbeat } from "@/app/actions/heartbeat-board-member";
+import { deleteManualBoardMember, insertManualBoardMember } from "@/app/actions/manual-board-member";
+import { isMemberOnline } from "@/lib/members-online";
 import {
+  loadMembersOnly,
   loadProjectsOnly,
   rowToProject,
   syncProjectsOnly,
+  type MemberRow,
   type ProjectRow,
 } from "@/lib/sync/dashboard";
 
@@ -32,7 +37,24 @@ type Member = {
   role: MemberRole;
   /** Supabase Auth 사용자 id; 없으면 수동 추가 멤버 */
   userId?: string | null;
+  /** members.last_seen_at (DB 동기화 시) */
+  lastSeenAt?: string | null;
 };
+
+function mapMemberRowToPageMember(row: MemberRow): Member {
+  const role: MemberRole = row.role === "관리자" ? "관리자" : "사용자";
+  const m: Member = {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    role,
+    lastSeenAt: row.last_seen_at ?? null,
+  };
+  if (row.user_id != null) {
+    m.userId = row.user_id;
+  }
+  return m;
+}
 
 type Mention = {
   memberId: string;
@@ -675,6 +697,19 @@ export default function Page() {
   /** 원격 프로젝트 병합·Realtime 시 assignee sanitize용 (멤버는 Supabase와 무관) */
   const localMembersSnapshotRef = useRef<Member[]>([]);
   const supabaseProjectsBootstrappedRef = useRef(false);
+  const realtimeMembersDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const refreshMembersFromServer = useCallback(async () => {
+    if (!isSupabaseDashboardEnabled() || !getFlowchartShareId()?.trim()) return;
+    try {
+      const { members } = await loadMembersOnly();
+      const mapped = members.map(mapMemberRowToPageMember);
+      setGlobalMembers(mapped);
+      localMembersSnapshotRef.current = mapped;
+    } catch (e) {
+      console.error("[flowchart] loadMembersOnly failed", e);
+    }
+  }, []);
 
   useEffect(() => {
     localMembersSnapshotRef.current = globalMembers;
@@ -712,6 +747,29 @@ export default function Page() {
     storageReady && isSupabaseDashboardEnabled() ? getFlowchartShareId()?.trim() || null : null;
 
   useEffect(() => {
+    if (!isSupabaseDashboardEnabled() || !getFlowchartShareId()?.trim() || !authUserId) return;
+
+    let cancelled = false;
+
+    async function heartbeat() {
+      if (cancelled) return;
+      const r = await touchBoardMemberHeartbeat();
+      if (!r.ok) {
+        console.error("[flowchart] touchBoardMemberHeartbeat", r);
+      }
+      await refreshMembersFromServer();
+    }
+
+    void heartbeat();
+    const id = window.setInterval(() => void heartbeat(), 30_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [authUserId, storageReady, refreshMembersFromServer]);
+
+  useEffect(() => {
     let cancelled = false;
     let hydratedMembers: Member[] = [];
 
@@ -720,7 +778,7 @@ export default function Page() {
       if (raw) {
         const parsed = parsePersistedJson(raw);
         if (parsed) {
-          if (parsed.globalMembers != null) {
+          if (parsed.globalMembers != null && !isSupabaseDashboardEnabled()) {
             hydratedMembers = normalizeStoredMembers(parsed.globalMembers);
             if (!cancelled) {
               setGlobalMembers(hydratedMembers);
@@ -792,6 +850,16 @@ export default function Page() {
         if (!ensured.ok) {
           console.error("[flowchart] ensureBoardMemberForCurrentUser failed", ensured);
         }
+        if (!cancelled) {
+          try {
+            const { members: mbRows } = await loadMembersOnly();
+            const mapped = mbRows.map(mapMemberRowToPageMember);
+            setGlobalMembers(mapped);
+            localMembersSnapshotRef.current = mapped;
+          } catch (me) {
+            console.error("[flowchart] loadMembersOnly failed", me);
+          }
+        }
         const data = await loadProjectsOnly();
         if (cancelled || loadGen !== remoteProjectsLoadGenRef.current) return;
 
@@ -831,7 +899,7 @@ export default function Page() {
       const payload: PersistedState = {
         projects,
         selectedId,
-        globalMembers,
+        globalMembers: isSupabaseDashboardEnabled() ? [] : globalMembers,
       };
       localStorage.setItem(FLOWCHART_LEGACY_STORAGE_KEY, JSON.stringify(payload));
     } catch {
@@ -867,6 +935,10 @@ export default function Page() {
         clearTimeout(realtimeDebounceRef.current);
         realtimeDebounceRef.current = null;
       }
+      if (realtimeMembersDebounceRef.current) {
+        clearTimeout(realtimeMembersDebounceRef.current);
+        realtimeMembersDebounceRef.current = null;
+      }
       const ch = realtimeChannelRef.current;
       if (!ch) return;
       try {
@@ -884,6 +956,7 @@ export default function Page() {
 
     const sb = getSupabaseBrowserClient();
     const shareIdLocked: string = subscriptionShareId;
+    const useServerFilter = SHARE_ID_UUID_RE.test(shareIdLocked);
 
     teardownRealtimeChannel();
 
@@ -935,7 +1008,27 @@ export default function Page() {
       }, 400);
     }
 
-    const useServerFilter = SHARE_ID_UUID_RE.test(shareIdLocked);
+    function scheduleMembersReload() {
+      if (realtimeMembersDebounceRef.current) clearTimeout(realtimeMembersDebounceRef.current);
+      realtimeMembersDebounceRef.current = setTimeout(() => {
+        realtimeMembersDebounceRef.current = null;
+        void refreshMembersFromServer();
+      }, 400);
+    }
+
+    function onMembersPostgresChange() {
+      return (payload: {
+        eventType?: string;
+        new?: { share_id?: string };
+        old?: { share_id?: string };
+      }) => {
+        if (!useServerFilter && !realtimeEventMatchesShare(payload, shareIdLocked)) {
+          return;
+        }
+        scheduleMembersReload();
+      };
+    }
+
     if (!useServerFilter) {
       console.warn(
         "[flowchart] realtime: NEXT_PUBLIC_FLOWCHART_SHARE_ID must be a UUID string. DB column share_id is uuid — Realtime filter `share_id=eq....` and sync may fail otherwise."
@@ -964,8 +1057,14 @@ export default function Page() {
         { event: "*", schema: "public", table: "projects", filter },
         onPostgresChange()
       );
+      channel.on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "members", filter },
+        onMembersPostgresChange()
+      );
     } else {
       channel.on("postgres_changes", { event: "*", schema: "public", table: "projects" }, onPostgresChange());
+      channel.on("postgres_changes", { event: "*", schema: "public", table: "members" }, onMembersPostgresChange());
     }
 
     channel.subscribe(() => {});
@@ -975,7 +1074,7 @@ export default function Page() {
     return () => {
       teardownRealtimeChannel();
     };
-  }, [subscriptionShareId]);
+  }, [subscriptionShareId, refreshMembersFromServer]);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedId) ?? projects[0] ?? null,
@@ -1237,7 +1336,7 @@ export default function Page() {
     );
   }
 
-  function addGlobalMember() {
+  async function addGlobalMember() {
     const name = memberForm.name.trim();
     const email = memberForm.email.trim();
 
@@ -1257,17 +1356,38 @@ export default function Page() {
       return;
     }
 
+    if (isSupabaseDashboardEnabled() && getFlowchartShareId()) {
+      const res = await insertManualBoardMember({ name, email, role: memberForm.role });
+      if (!res.ok) {
+        alert(res.message ?? "멤버 추가에 실패했습니다.");
+        return;
+      }
+      await refreshMembersFromServer();
+      setMemberForm(emptyMemberForm());
+      return;
+    }
+
     setGlobalMembers([...globalMembers, createMember(name, email, memberForm.role)]);
     setMemberForm(emptyMemberForm());
   }
 
-  function removeGlobalMember(memberId: string) {
+  async function removeGlobalMember(memberId: string) {
     const target = globalMembers.find((m) => m.id === memberId);
     if (target?.userId) {
       alert("계정과 연결된 멤버는 목록에서 삭제할 수 없습니다.");
       return;
     }
-    setGlobalMembers(globalMembers.filter((member) => member.id !== memberId));
+
+    if (isSupabaseDashboardEnabled() && getFlowchartShareId()) {
+      const res = await deleteManualBoardMember(memberId);
+      if (!res.ok) {
+        alert(res.message ?? "삭제에 실패했습니다.");
+        return;
+      }
+      await refreshMembersFromServer();
+    } else {
+      setGlobalMembers(globalMembers.filter((member) => member.id !== memberId));
+    }
 
     setProjects((prev) =>
       prev.map((project) => ({
@@ -1610,14 +1730,14 @@ export default function Page() {
                             <div className="min-w-0">
                               <div className="flex flex-wrap items-center gap-1.5">
                                 <span className="truncate text-sm font-semibold">{member.name}</span>
-                                {member.userId ? (
-                                  <span className="shrink-0 rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">
-                                    연결됨
-                                  </span>
-                                ) : null}
                                 {member.userId && authUserId && member.userId === authUserId ? (
                                   <span className="shrink-0 rounded-md bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800">
                                     나
+                                  </span>
+                                ) : null}
+                                {isMemberOnline(member.lastSeenAt) ? (
+                                  <span className="shrink-0 rounded-md bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-800">
+                                    접속중
                                   </span>
                                 ) : null}
                               </div>
@@ -1627,7 +1747,7 @@ export default function Page() {
 
                           <button
                             type="button"
-                            onClick={() => removeGlobalMember(member.id)}
+                            onClick={() => void removeGlobalMember(member.id)}
                             disabled={Boolean(member.userId)}
                             className="rounded-xl border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
                           >
@@ -1666,7 +1786,7 @@ export default function Page() {
 
                     <button
                       type="button"
-                      onClick={addGlobalMember}
+                      onClick={() => void addGlobalMember()}
                       className="w-full rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white"
                     >
                       + Add Member

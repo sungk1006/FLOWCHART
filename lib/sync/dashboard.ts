@@ -23,6 +23,7 @@ export type MemberRow = {
   email: string;
   role: string;
   user_id: string | null;
+  last_seen_at?: string | null;
 };
 
 /** page.tsx Project와 구조 호환 — sync 경계에서만 사용 */
@@ -129,6 +130,7 @@ export async function loadDashboard(): Promise<{
     email: String(r.email ?? ""),
     role: String(r.role),
     user_id: parseMemberUserIdColumn(r.user_id),
+    last_seen_at: r.last_seen_at != null ? String(r.last_seen_at) : null,
   }));
 
   const projects = (pmRes.data ?? []) as ProjectRow[];
@@ -151,6 +153,32 @@ export async function loadProjectsOnly(): Promise<{ projects: ProjectRow[] }> {
   if (pmRes.error) throw pmRes.error;
 
   return { projects: (pmRes.data ?? []) as ProjectRow[] };
+}
+
+export async function loadMembersOnly(): Promise<{ members: MemberRow[] }> {
+  const sb = getSupabaseBrowserClient();
+
+  if (!process.env.NEXT_PUBLIC_FLOWCHART_SHARE_ID?.trim()) {
+    throw new Error("NEXT_PUBLIC_FLOWCHART_SHARE_ID is not set");
+  }
+
+  const shareId = process.env.NEXT_PUBLIC_FLOWCHART_SHARE_ID!.trim();
+  const mbRes = await sb.from("members").select("*").eq("share_id", shareId);
+
+  if (mbRes.error) throw mbRes.error;
+
+  const rawMembers = (mbRes.data ?? []) as Record<string, unknown>[];
+  const members: MemberRow[] = rawMembers.map((r) => ({
+    id: String(r.id),
+    share_id: String(r.share_id),
+    name: String(r.name ?? ""),
+    email: String(r.email ?? ""),
+    role: String(r.role),
+    user_id: parseMemberUserIdColumn(r.user_id),
+    last_seen_at: r.last_seen_at != null ? String(r.last_seen_at) : null,
+  }));
+
+  return { members };
 }
 
 export async function upsertProject(p: ProjectSyncInput): Promise<void> {
