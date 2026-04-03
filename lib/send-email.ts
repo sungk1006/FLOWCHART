@@ -12,11 +12,6 @@ export type SendFlowchartEmailResult = {
   error?: string;
 };
 
-function getFromAddress(): string | undefined {
-  const v = process.env.EMAIL_FROM?.trim();
-  return v || undefined;
-}
-
 function getResendApiKey(): string | undefined {
   const v = process.env.RESEND_API_KEY?.trim();
   return v || undefined;
@@ -51,16 +46,15 @@ export async function sendFlowchartEmail(options: {
     console.log(`[FLOWCHART email:mock][${options.kind}]`);
     console.log("  intended recipient:", intendedTo);
     console.log("  delivery recipient (actual send):", deliveryTo);
-    console.log("  from:", getFromAddress() ?? "(EMAIL_FROM - mock에서는 미사용)");
+    console.log("  from:", process.env.EMAIL_FROM?.trim() ?? "(EMAIL_FROM - mock에서는 미사용)");
     console.log("  subject:", options.subject);
     console.log("  body:\n" + options.text);
     return { ok: true, mock: true };
   }
 
-  const from = getFromAddress();
   const apiKey = getResendApiKey();
 
-  if (!from) {
+  if (!process.env.EMAIL_FROM?.trim()) {
     return { ok: false, mock: false, error: "EMAIL_FROM is not set" };
   }
 
@@ -80,7 +74,7 @@ export async function sendFlowchartEmail(options: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        from,
+        from: process.env.EMAIL_FROM!.trim(),
         to: [deliveryTo],
         subject: options.subject,
         text: options.text,
