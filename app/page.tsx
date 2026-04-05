@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   buildDueReminderProcessRequest,
@@ -13,6 +13,11 @@ import { type MentionNotifyResponse } from "@/lib/mention-email";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import {
+  getStepAttachmentSignedUrl,
+  removeStepAttachmentFromStorage,
+  uploadStepAttachmentToStorage,
+} from "@/lib/supabase/step-attachments";
 import { FLOWCHART_LEGACY_STORAGE_KEY, getFlowchartShareId, isSupabaseDashboardEnabled } from "@/lib/sync/constants";
 import { deleteBoardMemberAsAdmin } from "@/app/actions/delete-board-member";
 import { ensureBoardMemberForCurrentUser } from "@/app/actions/ensure-board-member";
@@ -87,6 +92,15 @@ type StepComment = {
   createdAt: string;
 };
 
+type StepAttachment = {
+  id: string;
+  name: string;
+  path: string;
+  mimeType: string;
+  size: number;
+  uploadedAt: string;
+};
+
 type NotificationLogEmailRecipient = {
   email: string;
   name: string;
@@ -130,6 +144,8 @@ type Step = {
   memo: string;
   assigneeMemberIds: string[];
   comments: StepComment[];
+  /** Supabase Storage object path (bucket `flowchart-step-files`) */
+  attachments?: StepAttachment[];
   /** 하위 스텝이 있을 때만 — 플로우차트에서 펼침 여부 */
   expanded?: boolean;
   subSteps?: Step[];
@@ -426,7 +442,44 @@ function createStep(label: string): Step {
     memo: "",
     assigneeMemberIds: [],
     comments: [],
+    attachments: [],
   };
+}
+
+function normalizeAttachmentsFromStorage(raw: unknown): StepAttachment[] {
+  if (!Array.isArray(raw)) return [];
+  const out: StepAttachment[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    const id = typeof o.id === "string" && o.id.trim() ? o.id.trim() : "";
+    const name = typeof o.name === "string" ? o.name : "";
+    const path = typeof o.path === "string" && o.path.trim() ? o.path.trim() : "";
+    const mimeType =
+      typeof o.mimeType === "string"
+        ? o.mimeType
+        : typeof o.mime_type === "string"
+          ? o.mime_type
+          : "";
+    const size =
+      typeof o.size === "number" && Number.isFinite(o.size) && o.size >= 0 ? o.size : 0;
+    const uploadedAt =
+      typeof o.uploadedAt === "string"
+        ? o.uploadedAt
+        : typeof o.uploaded_at === "string"
+          ? o.uploaded_at
+          : "";
+    if (!id || !path) continue;
+    out.push({
+      id,
+      name: name.trim() || path.split("/").pop() || "file",
+      path,
+      mimeType: mimeType || "application/octet-stream",
+      size,
+      uploadedAt,
+    });
+  }
+  return out;
 }
 
 const NEW_PRODUCT_SUB_LABELS = [
@@ -779,6 +832,407 @@ function buildAllFlowchartVisibleRows(phases: Phase[]): FlowchartVisibleRow[] {
   return out;
 }
 
+type FlowchartRowHandlers = {
+  onToggleChecked: (phaseId: string, stepId: string, checked: boolean) => void;
+  onToggleNotApplicable: (phaseId: string, stepId: string, checked: boolean) => void;
+  onToggleExpanded: (phaseId: string, stepId: string) => void;
+  onPatchDraft: (stepId: string, patch: Partial<StepEditorDraft>, baseStep: Step) => void;
+  onResetDraft: (stepId: string) => void;
+  onSaveDraft: (phaseId: string, stepId: string) => void;
+  onApplyMention: (stepId: string, member: Member, baseStep: Step) => void;
+  onUploadStepFiles: (phaseId: string, stepId: string, files: File[]) => void;
+  onOpenAttachmentPath: (path: string) => void;
+  onRemoveAttachment: (phaseId: string, stepId: string, path: string) => void;
+};
+
+type FlowchartRowProps = {
+  phaseId: string;
+  step: Step;
+  depth: number;
+  displayIndex: string;
+  isChildRow: boolean;
+  draft: StepEditorDraft;
+  mentionCandidates: Member[];
+  rowHighlight: boolean;
+  overdue: boolean;
+  dueSoonLabel: string | null;
+  selectedProjectId: string;
+  members: Member[];
+  savingStepId: string | null;
+  attachmentsEnabled: boolean;
+  uploadingAttachment: boolean;
+  handlers: FlowchartRowHandlers;
+};
+
+const FlowchartRow = memo(function FlowchartRow({
+  phaseId,
+  step,
+  depth,
+  displayIndex,
+  isChildRow,
+  draft,
+  mentionCandidates,
+  rowHighlight,
+  overdue,
+  dueSoonLabel,
+  selectedProjectId,
+  members,
+  savingStepId,
+  attachmentsEnabled,
+  uploadingAttachment,
+  handlers,
+}: FlowchartRowProps) {
+  const mentionQuery = extractMentionQuery(draft.memo);
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
+  const [dragHighlight, setDragHighlight] = useState(false);
+  const dragDepthRef = useRef(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const attachMenuRef = useRef<HTMLDivElement>(null);
+  const attachBtnRef = useRef<HTMLButtonElement>(null);
+
+  const attachmentList = step.attachments ?? [];
+  const attachmentCount = attachmentList.length;
+
+  useEffect(() => {
+    if (!attachMenuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (attachMenuRef.current?.contains(t)) return;
+      if (attachBtnRef.current?.contains(t)) return;
+      setAttachMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [attachMenuOpen]);
+
+  const rowSurface = step.notApplicable
+    ? rowHighlight
+      ? "bg-neutral-100/95 ring-2 ring-blue-200 ring-inset"
+      : isChildRow
+        ? "bg-neutral-100"
+        : "bg-neutral-50/90"
+    : overdue && rowHighlight
+      ? "bg-rose-50/60 ring-2 ring-blue-200 ring-inset"
+      : overdue
+        ? isChildRow
+          ? "bg-rose-50/70"
+          : "bg-rose-50/60"
+        : rowHighlight
+          ? "bg-blue-50/40 ring-2 ring-blue-200 ring-inset"
+          : isChildRow
+            ? "bg-[#f1f1f1]"
+            : "bg-white";
+
+  const gridClass =
+    "grid grid-cols-[36px_52px_44px_minmax(280px,360px)_150px_150px_150px_minmax(280px,1fr)_72px_72px] items-start gap-x-2 border-b border-neutral-200 px-2 py-1.5 " +
+    rowSurface +
+    (dragHighlight && attachmentsEnabled && !uploadingAttachment
+      ? " ring-2 ring-blue-400/70 ring-inset bg-blue-50/30"
+      : "");
+
+  return (
+    <div
+      id={`step-${step.id}`}
+      data-project-id={selectedProjectId}
+      className={gridClass}
+      onDragEnter={(e) => {
+        if (!attachmentsEnabled || uploadingAttachment) return;
+        e.preventDefault();
+        e.stopPropagation();
+        dragDepthRef.current += 1;
+        if (dragDepthRef.current === 1) setDragHighlight(true);
+      }}
+      onDragLeave={(e) => {
+        if (!attachmentsEnabled) return;
+        e.preventDefault();
+        e.stopPropagation();
+        dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+        if (dragDepthRef.current === 0) setDragHighlight(false);
+      }}
+      onDragOver={(e) => {
+        if (!attachmentsEnabled || uploadingAttachment) return;
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+      onDrop={(e) => {
+        if (!attachmentsEnabled || uploadingAttachment) return;
+        e.preventDefault();
+        e.stopPropagation();
+        dragDepthRef.current = 0;
+        setDragHighlight(false);
+        const fl = e.dataTransfer.files;
+        if (fl?.length) {
+          handlers.onUploadStepFiles(phaseId, step.id, Array.from(fl));
+        }
+      }}
+    >
+      <div className="flex justify-center pt-1">
+        <input
+          type="checkbox"
+          checked={step.checked}
+          disabled={step.notApplicable}
+          onChange={(e) => handlers.onToggleChecked(phaseId, step.id, e.target.checked)}
+          className="h-4 w-4 accent-blue-600 disabled:cursor-not-allowed disabled:opacity-60"
+          aria-label={`완료: ${step.label}`}
+        />
+      </div>
+      <div className="flex justify-center pt-1">
+        <input
+          type="checkbox"
+          checked={step.notApplicable}
+          onChange={(e) => handlers.onToggleNotApplicable(phaseId, step.id, e.target.checked)}
+          className="h-4 w-4 accent-neutral-500"
+          aria-label={`해당 없음(N/A): ${step.label}`}
+        />
+      </div>
+      <div
+        className={`pt-1 text-center tabular-nums ${
+          isChildRow ? "text-sm font-semibold text-neutral-300" : "text-[15px] font-extrabold text-neutral-800"
+        }`}
+      >
+        {displayIndex || "\u00a0"}
+      </div>
+      <div
+        className="flex min-w-0 items-start gap-1.5 py-1 text-left text-[15px] font-medium text-neutral-900"
+        style={isChildRow ? { paddingLeft: 8 + Math.max(0, depth - 1) * 8 } : undefined}
+      >
+        {step.subSteps && step.subSteps.length > 0 ? (
+          <button
+            type="button"
+            onClick={() => handlers.onToggleExpanded(phaseId, step.id)}
+            className="h-7 w-7 shrink-0 rounded-md text-sm text-neutral-500 hover:bg-neutral-200/80 hover:text-neutral-800"
+            aria-expanded={Boolean(step.expanded)}
+            aria-label={step.expanded ? "하위 접기" : "하위 펼치기"}
+          >
+            {step.expanded ? "▼" : "▶"}
+          </button>
+        ) : (
+          <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center text-neutral-300" aria-hidden>
+            ·
+          </span>
+        )}
+
+        {isChildRow ? <span className="shrink-0 text-[12px] font-semibold text-neutral-400">└</span> : null}
+
+        <span
+          className={`min-w-0 ${
+            isChildRow
+              ? "text-[14px] font-medium text-neutral-700"
+              : "text-[15px] font-extrabold tracking-[-0.02em] text-neutral-900"
+          }`}
+          style={{
+            whiteSpace: "normal",
+            overflowWrap: "anywhere",
+            wordBreak: "keep-all",
+            lineHeight: 1.25,
+          }}
+        >
+          {step.label}
+        </span>
+
+        {step.subSteps?.length ? (
+          <span className="shrink-0 rounded bg-neutral-100 px-1.5 py-0.5 text-[10px] font-semibold text-neutral-500">
+            {step.subSteps.length}
+          </span>
+        ) : null}
+
+        {step.notApplicable ? (
+          <span className="shrink-0 rounded border border-neutral-200 bg-neutral-100/90 px-1 py-0.5 text-[10px] font-semibold text-neutral-600">
+            N/A
+          </span>
+        ) : null}
+
+        {overdue ? (
+          <span className="shrink-0 rounded border border-rose-200 bg-rose-50 px-1 py-0.5 text-[10px] font-semibold text-rose-700">
+            OVERDUE
+          </span>
+        ) : null}
+
+        {!overdue && dueSoonLabel ? (
+          <span className="shrink-0 rounded border border-emerald-300 bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800">
+            {dueSoonLabel}
+          </span>
+        ) : null}
+
+        <div className="relative shrink-0">
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              const fl = e.target.files;
+              if (fl?.length && attachmentsEnabled) {
+                handlers.onUploadStepFiles(phaseId, step.id, Array.from(fl));
+              }
+              e.target.value = "";
+            }}
+          />
+          <button
+            ref={attachBtnRef}
+            type="button"
+            disabled={!attachmentsEnabled || uploadingAttachment}
+            title={
+              attachmentsEnabled
+                ? "첨부 파일 (클릭하여 선택 · 드래그 앤 드롭)"
+                : "Supabase 보드 연결 시 첨부 가능"
+            }
+            onClick={(ev) => {
+              ev.stopPropagation();
+              if (!attachmentsEnabled || uploadingAttachment) return;
+              if (attachmentCount > 0) {
+                setAttachMenuOpen((o) => !o);
+              } else {
+                fileInputRef.current?.click();
+              }
+            }}
+            className={
+              "relative flex h-7 min-w-[1.75rem] items-center justify-center rounded-md border px-1 transition-colors " +
+              (attachmentsEnabled && !uploadingAttachment
+                ? "border-neutral-200 bg-white text-neutral-600 hover:bg-neutral-100"
+                : "cursor-not-allowed border-transparent text-neutral-300 opacity-70")
+            }
+            aria-label="첨부 파일"
+          >
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden
+            >
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+            </svg>
+            {attachmentCount > 0 ? (
+              <span className="absolute -right-1 -top-1 flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-slate-800 px-0.5 text-[9px] font-bold text-white">
+                {attachmentCount > 9 ? "9+" : attachmentCount}
+              </span>
+            ) : null}
+          </button>
+          {uploadingAttachment ? (
+            <span className="mt-0.5 block text-center text-[9px] text-neutral-500">업로드 중…</span>
+          ) : null}
+          {attachMenuOpen && attachmentsEnabled ? (
+            <div
+              ref={attachMenuRef}
+              className="absolute left-0 top-full z-40 mt-1 w-64 max-w-[70vw] rounded-lg border border-neutral-200 bg-white p-2 shadow-lg"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="mb-2 flex items-center justify-between gap-2 border-b border-neutral-100 pb-2">
+                <span className="text-[11px] font-semibold text-neutral-700">첨부 {attachmentCount}개</span>
+                <button
+                  type="button"
+                  className="text-[10px] font-medium text-blue-600 hover:underline"
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  + 추가
+                </button>
+              </div>
+              <ul className="max-h-40 space-y-1 overflow-y-auto">
+                {attachmentList.map((a) => (
+                  <li
+                    key={a.id}
+                    className="flex items-start gap-1 rounded border border-neutral-100 bg-neutral-50/80 px-1.5 py-1 text-[11px]"
+                  >
+                    <span className="min-w-0 flex-1 truncate text-neutral-800" title={a.name}>
+                      {a.name}
+                    </span>
+                    <button
+                      type="button"
+                      className="shrink-0 text-[10px] font-medium text-blue-600 hover:underline"
+                      onClick={() => handlers.onOpenAttachmentPath(a.path)}
+                    >
+                      열기
+                    </button>
+                    <button
+                      type="button"
+                      className="shrink-0 text-[10px] font-medium text-rose-600 hover:underline"
+                      onClick={() => handlers.onRemoveAttachment(phaseId, step.id, a.path)}
+                    >
+                      삭제
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
+      </div>
+      <div className="rounded border border-neutral-200 px-1.5 py-1 pt-1.5">
+        <Input
+          type="date"
+          value={draft.dueDate}
+          onChange={(v) => handlers.onPatchDraft(step.id, { dueDate: v }, step)}
+          className="text-[14px]"
+        />
+      </div>
+      <div className="rounded border border-neutral-200 px-1.5 py-1 pt-1.5">
+        <Input
+          type="date"
+          value={draft.confirmedAt}
+          onChange={(v) => handlers.onPatchDraft(step.id, { confirmedAt: v }, step)}
+          className="text-[14px]"
+        />
+      </div>
+      <div className="min-w-0 pt-1">
+        <AssigneeMultiSelect
+          compact
+          members={members}
+          selectedIds={draft.assigneeMemberIds}
+          onChange={(next) => handlers.onPatchDraft(step.id, { assigneeMemberIds: next }, step)}
+        />
+      </div>
+      <div className="relative min-w-0 pt-1">
+        <TextArea
+          value={draft.memo}
+          onChange={(v) => handlers.onPatchDraft(step.id, { memo: v }, step)}
+          placeholder="@멘션 · 확인 시 저장"
+          rows={2}
+          className="min-h-[38px] py-1 text-[13px] leading-snug"
+        />
+        {mentionQuery !== null && mentionCandidates.length > 0 && (
+          <div className="absolute left-0 right-0 top-full z-30 mt-0.5 max-h-40 overflow-y-auto rounded-lg border border-neutral-200 bg-white p-1.5 shadow-lg">
+            {mentionCandidates.map((member) => (
+              <button
+                key={member.id}
+                type="button"
+                onClick={() => handlers.onApplyMention(step.id, member, step)}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-neutral-50"
+              >
+                <MemberInitial name={member.name} />
+                <span className="truncate font-medium">{member.name}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      <div className="flex justify-center pt-1">
+        <button
+          type="button"
+          onClick={() => handlers.onResetDraft(step.id)}
+          className="rounded-lg border border-rose-200 bg-rose-50 px-2 py-1.5 text-[10px] font-medium text-rose-700"
+        >
+          초기화
+        </button>
+      </div>
+      <div className="flex justify-center pt-1">
+        <button
+          type="button"
+          disabled={savingStepId === step.id}
+          onClick={() => void handlers.onSaveDraft(phaseId, step.id)}
+          className="rounded-lg border border-slate-900 bg-slate-900 px-2 py-1.5 text-[10px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {savingStepId === step.id ? "…" : "확인"}
+        </button>
+      </div>
+    </div>
+  );
+});
+
 function createFixedFlowchartPhases(): Phase[] {
   return [
     {
@@ -899,6 +1353,7 @@ function normalizeStepFromStorage(step: Step): Step {
   const finalSubs = subSteps && subSteps.length > 0 ? subSteps : undefined;
 
   const s = step as Step;
+  const attachments = normalizeAttachmentsFromStorage(r.attachments);
   return {
     id: s.id,
     label,
@@ -910,6 +1365,7 @@ function normalizeStepFromStorage(step: Step): Step {
     memo: typeof s.memo === "string" ? s.memo : "",
     assigneeMemberIds,
     comments,
+    attachments: attachments.length > 0 ? attachments : [],
     expanded: finalSubs ? Boolean(s.expanded) : undefined,
     subSteps: finalSubs,
   };
@@ -1784,6 +2240,8 @@ function realtimeEventMatchesShare(
 export default function Page() {
   const [projects, setProjects] = useState<Project[]>(initialProjects);
   const [selectedId, setSelectedId] = useState<string>(initialProjects[0]?.id ?? "");
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
 
   const [globalMembers, setGlobalMembers] = useState<Member[]>([]);
   const [authUserId, setAuthUserId] = useState<string | null>(null);
@@ -1809,9 +2267,13 @@ export default function Page() {
   const [storageReady, setStorageReady] = useState(false);
   /** URL ?step= 딥링크로 포커스된 행 강조 */
   const [highlightedStepId, setHighlightedStepId] = useState<string | null>(null);
+  /** step.id → 해당 행 스토리지 업로드 중 */
+  const [uploadingAttachmentStepIds, setUploadingAttachmentStepIds] = useState<Record<string, boolean>>({});
 
   const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const realtimeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastLocalPersistFingerprintRef = useRef<string>("");
+  const lastSyncedProjectsFingerprintRef = useRef<string>("");
   const lastRemoteFingerprintRef = useRef<string>("");
   const realtimeChannelRef = useRef<RealtimeChannel | null>(null);
   const remoteProjectsLoadGenRef = useRef(0);
@@ -2073,11 +2535,27 @@ export default function Page() {
         detailSearch,
         selectOptions,
       };
-      localStorage.setItem(FLOWCHART_LEGACY_STORAGE_KEY, JSON.stringify(payload));
+
+      const nextFingerprint = JSON.stringify(payload);
+      if (lastLocalPersistFingerprintRef.current === nextFingerprint) {
+        return;
+      }
+      lastLocalPersistFingerprintRef.current = nextFingerprint;
+      localStorage.setItem(FLOWCHART_LEGACY_STORAGE_KEY, nextFingerprint);
     } catch {
-      // 할당량 초과 등
+      // ignore
     }
-  }, [projects, selectedId, globalMembers, storageReady, sidebarFilters, detailFilters, sidebarSearch, detailSearch, selectOptions]);
+  }, [
+    projects,
+    selectedId,
+    globalMembers,
+    storageReady,
+    sidebarFilters,
+    detailFilters,
+    sidebarSearch,
+    detailSearch,
+    selectOptions,
+  ]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !storageReady) return;
@@ -2161,13 +2639,29 @@ export default function Page() {
     if (!getFlowchartShareId()) return;
     if (!supabaseProjectsBootstrappedRef.current) return;
 
+    const nextFingerprint = dashboardDataFingerprint(projects);
+    if (lastSyncedProjectsFingerprintRef.current === nextFingerprint) {
+      return;
+    }
+
     if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
     syncTimerRef.current = setTimeout(() => {
       syncTimerRef.current = null;
       if (!supabaseProjectsBootstrappedRef.current) return;
-      void syncProjectsOnly(projects).catch((e) => {
-        console.error("[flowchart] syncProjectsOnly failed", e);
-      });
+
+      const latestProjects = projectsRef.current;
+      const latestFingerprint = dashboardDataFingerprint(latestProjects);
+      if (lastSyncedProjectsFingerprintRef.current === latestFingerprint) {
+        return;
+      }
+
+      void syncProjectsOnly(latestProjects)
+        .then(() => {
+          lastSyncedProjectsFingerprintRef.current = latestFingerprint;
+        })
+        .catch((e) => {
+          console.error("[flowchart] syncProjectsOnly failed", e);
+        });
     }, 800);
 
     return () => {
@@ -2230,9 +2724,16 @@ export default function Page() {
           return;
         }
 
-        lastRemoteFingerprintRef.current = fp;
+        setProjects((prev) => {
+          const prevFp = dashboardDataFingerprint(prev);
+          if (prevFp === fp && !DEBUG_REALTIME_DISABLE_FINGERPRINT_SKIP) {
+            lastRemoteFingerprintRef.current = fp;
+            return prev;
+          }
+          lastRemoteFingerprintRef.current = fp;
+          return finalProjects;
+        });
 
-        setProjects(finalProjects);
         setSelectedId((prev) => {
           const ids = new Set(finalProjects.map((p) => p.id));
           if (ids.has(prev)) {
@@ -2241,8 +2742,7 @@ export default function Page() {
           if (finalProjects.length === 0) {
             return "";
           }
-          const first = finalProjects[0]?.id ?? "";
-          return first;
+          return finalProjects[0]?.id ?? "";
         });
       } catch (e) {
         console.error("[flowchart] realtime reload failed", e);
@@ -2329,6 +2829,11 @@ export default function Page() {
     () => projects.find((project) => project.id === selectedId) ?? projects[0] ?? null,
     [projects, selectedId]
   );
+
+  const visibleFlowchartRows = useMemo(() => {
+    if (!selectedProject) return [];
+    return buildAllFlowchartVisibleRows(selectedProject.phases);
+  }, [selectedProject]);
 
   useEffect(() => {
     if (!selectedProject) return;
@@ -2758,18 +3263,49 @@ export default function Page() {
     );
   }
 
-  function toggleStepNotApplicable(
-    projectId: string,
-    phaseId: string,
-    stepId: string,
-    checked: boolean
-  ) {
-    const phase = projects.find((p) => p.id === projectId)?.phases.find((ph) => ph.id === phaseId);
-    const st = phase ? findStepInPhaseSteps(phase.steps, stepId) : undefined;
-    if (!st) return;
+  const toggleStepNotApplicable = useCallback(
+    (projectId: string, phaseId: string, stepId: string, checked: boolean) => {
+      const phase = projectsRef.current
+        .find((p) => p.id === projectId)
+        ?.phases.find((ph) => ph.id === phaseId);
+      const st = phase ? findStepInPhaseSteps(phase.steps, stepId) : undefined;
+      if (!st) return;
 
-    if (checked) {
-      const confirmed = st.confirmedAt?.trim() ? st.confirmedAt : todayLocalDate();
+      if (checked) {
+        const confirmed = st.confirmedAt?.trim() ? st.confirmedAt : todayLocalDate();
+        setProjects((prev) =>
+          prev.map((project) => {
+            if (project.id !== projectId) return project;
+            return {
+              ...project,
+              updated: true,
+              lastChangedAt: nowString(),
+              phases: project.phases.map((ph) =>
+                ph.id !== phaseId
+                  ? ph
+                  : {
+                      ...ph,
+                      steps: reconcilePhaseSteps(
+                        patchStepInTree(ph.steps, stepId, (step) => ({
+                          ...step,
+                          notApplicable: true,
+                          checked: true,
+                          confirmedAt: confirmed,
+                          dueReminderSentAt: "",
+                        }))
+                      ),
+                    }
+              ),
+            };
+          })
+        );
+        setStepDrafts((prev) => ({
+          ...prev,
+          [stepId]: { ...(prev[stepId] ?? stepToDraft(st)), confirmedAt: confirmed },
+        }));
+        return;
+      }
+
       setProjects((prev) =>
         prev.map((project) => {
           if (project.id !== projectId) return project;
@@ -2785,10 +3321,8 @@ export default function Page() {
                     steps: reconcilePhaseSteps(
                       patchStepInTree(ph.steps, stepId, (step) => ({
                         ...step,
-                        notApplicable: true,
-                        checked: true,
-                        confirmedAt: confirmed,
-                        dueReminderSentAt: "",
+                        notApplicable: false,
+                        checked: false,
                       }))
                     ),
                   }
@@ -2798,43 +3332,16 @@ export default function Page() {
       );
       setStepDrafts((prev) => ({
         ...prev,
-        [stepId]: { ...(prev[stepId] ?? stepToDraft(st)), confirmedAt: confirmed },
+        [stepId]: { ...(prev[stepId] ?? stepToDraft(st)), confirmedAt: st.confirmedAt },
       }));
-      return;
-    }
+    },
+    []
+  );
 
-    setProjects((prev) =>
-      prev.map((project) => {
-        if (project.id !== projectId) return project;
-        return {
-          ...project,
-          updated: true,
-          lastChangedAt: nowString(),
-          phases: project.phases.map((ph) =>
-            ph.id !== phaseId
-              ? ph
-              : {
-                  ...ph,
-                  steps: reconcilePhaseSteps(
-                    patchStepInTree(ph.steps, stepId, (step) => ({
-                      ...step,
-                      notApplicable: false,
-                      checked: false,
-                    }))
-                  ),
-                }
-          ),
-        };
-      })
-    );
-    setStepDrafts((prev) => ({
-      ...prev,
-      [stepId]: { ...(prev[stepId] ?? stepToDraft(st)), confirmedAt: st.confirmedAt },
-    }));
-  }
-
-  function toggleStepChecked(projectId: string, phaseId: string, stepId: string, checked: boolean) {
-    const phase = projects.find((p) => p.id === projectId)?.phases.find((ph) => ph.id === phaseId);
+  const toggleStepChecked = useCallback((projectId: string, phaseId: string, stepId: string, checked: boolean) => {
+    const phase = projectsRef.current
+      .find((p) => p.id === projectId)
+      ?.phases.find((ph) => ph.id === phaseId);
     const st = phase ? findStepInPhaseSteps(phase.steps, stepId) : undefined;
     if (st?.notApplicable) return;
     const newConfirmed =
@@ -2875,10 +3382,12 @@ export default function Page() {
         },
       }));
     }
-  }
+  }, []);
 
-  function toggleStepExpanded(projectId: string, phaseId: string, stepId: string) {
-    const phase = projects.find((p) => p.id === projectId)?.phases.find((ph) => ph.id === phaseId);
+  const toggleStepExpanded = useCallback((projectId: string, phaseId: string, stepId: string) => {
+    const phase = projectsRef.current
+      .find((p) => p.id === projectId)
+      ?.phases.find((ph) => ph.id === phaseId);
     const st = phase ? findStepInPhaseSteps(phase.steps, stepId) : undefined;
     if (!st?.subSteps?.length) return;
     setProjects((prev) =>
@@ -2902,7 +3411,7 @@ export default function Page() {
         };
       })
     );
-  }
+  }, []);
 
   async function removeGlobalMember(memberId: string) {
     const target = globalMembers.find((m) => m.id === memberId);
@@ -2940,14 +3449,14 @@ export default function Page() {
     );
   }
 
-  function patchStepDraft(stepId: string, patch: Partial<StepEditorDraft>, baseStep: Step) {
+  const patchStepDraft = useCallback((stepId: string, patch: Partial<StepEditorDraft>, baseStep: Step) => {
     setStepDrafts((prev) => ({
       ...prev,
       [stepId]: { ...(prev[stepId] ?? stepToDraft(baseStep)), ...patch },
     }));
-  }
+  }, []);
 
-  function resetStepDraftFields(stepId: string) {
+  const resetStepDraftFields = useCallback((stepId: string) => {
     setStepDrafts((prev) => ({
       ...prev,
       [stepId]: {
@@ -2957,9 +3466,9 @@ export default function Page() {
         assigneeMemberIds: [],
       },
     }));
-  }
+  }, []);
 
-  function applyMentionToDraft(stepId: string, member: Member, baseStep: Step) {
+  const applyMentionToDraft = useCallback((stepId: string, member: Member, baseStep: Step) => {
     setStepDrafts((prev) => {
       const cur = prev[stepId] ?? stepToDraft(baseStep);
       const query = extractMentionQuery(cur.memo);
@@ -2967,9 +3476,9 @@ export default function Page() {
       const replaced = cur.memo.replace(/@([^\s@]*)$/, `@${member.name} `);
       return { ...prev, [stepId]: { ...cur, memo: replaced } };
     });
-  }
+  }, []);
 
-  async function saveStepDraft(projectId: string, phaseId: string, stepId: string) {
+  const saveStepDraft = useCallback(async (projectId: string, phaseId: string, stepId: string) => {
     if (!selectedProject || savingStepId) return;
     const phase = selectedProject.phases.find((ph) => ph.id === phaseId);
     const step = phase ? findStepInPhaseSteps(phase.steps, stepId) : undefined;
@@ -3138,7 +3647,164 @@ export default function Page() {
     } finally {
       setSavingStepId(null);
     }
-  }
+  }, [selectedProject, globalMembers, stepDrafts, savingStepId]);
+
+  const flowchartAttachmentsEnabled =
+    isSupabaseDashboardEnabled() && Boolean(getFlowchartShareId()?.trim());
+
+  const handleOpenAttachmentPath = useCallback(async (path: string) => {
+    const { url, error } = await getStepAttachmentSignedUrl(path);
+    if (!url) {
+      alert(error ?? "파일을 열 수 없습니다.");
+      return;
+    }
+    window.open(url, "_blank", "noopener,noreferrer");
+  }, []);
+
+  const handleUploadStepFiles = useCallback(
+    async (projectId: string, phaseId: string, stepId: string, files: File[]) => {
+      if (!flowchartAttachmentsEnabled) return;
+      const shareId = getFlowchartShareId()?.trim();
+      if (!shareId) return;
+      if (files.length === 0) return;
+      setUploadingAttachmentStepIds((prev) => ({ ...prev, [stepId]: true }));
+      try {
+        const uploaded: StepAttachment[] = [];
+        for (const file of files) {
+          const res = await uploadStepAttachmentToStorage({
+            shareId,
+            projectId,
+            stepId,
+            file,
+          });
+          if (!res.ok) {
+            alert(res.error);
+            continue;
+          }
+          uploaded.push({
+            id: createId("att"),
+            name: file.name,
+            path: res.path,
+            mimeType: file.type || "application/octet-stream",
+            size: file.size,
+            uploadedAt: new Date().toISOString(),
+          });
+        }
+        if (uploaded.length === 0) return;
+        setProjects((prev) =>
+          prev.map((project) => {
+            if (project.id !== projectId) return project;
+            return {
+              ...project,
+              updated: true,
+              lastChangedAt: nowString(),
+              phases: project.phases.map((ph) =>
+                ph.id !== phaseId
+                  ? ph
+                  : {
+                      ...ph,
+                      steps: reconcilePhaseSteps(
+                        patchStepInTree(ph.steps, stepId, (s) => ({
+                          ...s,
+                          attachments: [...(s.attachments ?? []), ...uploaded],
+                        }))
+                      ),
+                    }
+              ),
+            };
+          })
+        );
+      } finally {
+        setUploadingAttachmentStepIds((prev) => {
+          const next = { ...prev };
+          delete next[stepId];
+          return next;
+        });
+      }
+    },
+    [flowchartAttachmentsEnabled]
+  );
+
+  const handleRemoveAttachment = useCallback(
+    async (projectId: string, phaseId: string, stepId: string, path: string) => {
+      if (!flowchartAttachmentsEnabled) return;
+      const r = await removeStepAttachmentFromStorage(path);
+      if (!r.ok) {
+        alert(r.error ?? "스토리지에서 삭제하지 못했습니다.");
+        return;
+      }
+      setProjects((prev) =>
+        prev.map((project) => {
+          if (project.id !== projectId) return project;
+          return {
+            ...project,
+            updated: true,
+            lastChangedAt: nowString(),
+            phases: project.phases.map((ph) =>
+              ph.id !== phaseId
+                ? ph
+                : {
+                    ...ph,
+                    steps: reconcilePhaseSteps(
+                      patchStepInTree(ph.steps, stepId, (s) => ({
+                        ...s,
+                        attachments: (s.attachments ?? []).filter((a) => a.path !== path),
+                      }))
+                    ),
+                  }
+            ),
+          };
+        })
+      );
+    },
+    [flowchartAttachmentsEnabled]
+  );
+
+  const flowchartRowHandlers = useMemo<FlowchartRowHandlers>(
+    () => ({
+      onToggleChecked: (phaseId, stepId, checked) => {
+        if (!selectedProject) return;
+        toggleStepChecked(selectedProject.id, phaseId, stepId, checked);
+      },
+      onToggleNotApplicable: (phaseId, stepId, checked) => {
+        if (!selectedProject) return;
+        toggleStepNotApplicable(selectedProject.id, phaseId, stepId, checked);
+      },
+      onToggleExpanded: (phaseId, stepId) => {
+        if (!selectedProject) return;
+        toggleStepExpanded(selectedProject.id, phaseId, stepId);
+      },
+      onPatchDraft: patchStepDraft,
+      onResetDraft: resetStepDraftFields,
+      onSaveDraft: (phaseId, stepId) => {
+        if (!selectedProject) return;
+        void saveStepDraft(selectedProject.id, phaseId, stepId);
+      },
+      onApplyMention: applyMentionToDraft,
+      onUploadStepFiles: (phaseId, stepId, files) => {
+        if (!selectedProject) return;
+        void handleUploadStepFiles(selectedProject.id, phaseId, stepId, files);
+      },
+      onOpenAttachmentPath: handleOpenAttachmentPath,
+      onRemoveAttachment: (phaseId, stepId, path) => {
+        if (!selectedProject) return;
+        void handleRemoveAttachment(selectedProject.id, phaseId, stepId, path);
+      },
+    }),
+    [
+      selectedProject,
+      toggleStepChecked,
+      toggleStepExpanded,
+      toggleStepNotApplicable,
+      patchStepDraft,
+      resetStepDraftFields,
+      saveStepDraft,
+      applyMentionToDraft,
+      handleUploadStepFiles,
+      handleOpenAttachmentPath,
+      handleRemoveAttachment,
+    ]
+  );
 
   async function runDueReminderScan() {
     if (dueReminderBusy) return;
@@ -3903,223 +4569,44 @@ export default function Page() {
                       <div />
                     </div>
 
-                    {buildAllFlowchartVisibleRows(selectedProject.phases).map(
-                      ({ phaseId, step, depth, displayIndex, isChildRow }) => {
-                        const overdue = !step.checked && !!step.dueDate && isOverdue(step.dueDate);
-                        const dueSoonLabel = !step.checked && !overdue ? getDueSoonLabel(step.dueDate) : null;
-                        const draft = stepDrafts[step.id] ?? stepToDraft(step);
-                        const mentionQuery = extractMentionQuery(draft.memo);
-                        const mentionCandidates =
-                          mentionQuery !== null
-                            ? globalMembers.filter(
-                                (member) =>
-                                  member.name.toLowerCase().includes(mentionQuery.toLowerCase()) ||
-                                  member.email.toLowerCase().includes(mentionQuery.toLowerCase())
-                              )
-                            : [];
+                    {visibleFlowchartRows.map(({ phaseId, step, depth, displayIndex, isChildRow }) => {
+                      const overdue = !step.checked && !!step.dueDate && isOverdue(step.dueDate);
+                      const dueSoonLabel = !step.checked && !overdue ? getDueSoonLabel(step.dueDate) : null;
+                      const draft = stepDrafts[step.id] ?? stepToDraft(step);
+                      const mentionQuery = extractMentionQuery(draft.memo);
+                      const mentionCandidates =
+                        mentionQuery !== null
+                          ? globalMembers.filter(
+                              (member) =>
+                                member.name.toLowerCase().includes(mentionQuery.toLowerCase()) ||
+                                member.email.toLowerCase().includes(mentionQuery.toLowerCase())
+                            )
+                          : [];
 
-                        const rowHighlight = highlightedStepId === step.id;
-                        const rowSurface = step.notApplicable
-                          ? rowHighlight
-                            ? "bg-neutral-100/95 ring-2 ring-blue-200 ring-inset"
-                            : isChildRow
-                              ? "bg-neutral-100"
-                              : "bg-neutral-50/90"
-                          : overdue && rowHighlight
-                            ? "bg-rose-50/60 ring-2 ring-blue-200 ring-inset"
-                            : overdue
-                              ? isChildRow
-                                ? "bg-rose-50/70"
-                                : "bg-rose-50/60"
-                              : rowHighlight
-                                ? "bg-blue-50/40 ring-2 ring-blue-200 ring-inset"
-                                : isChildRow
-                                  ? "bg-[#f1f1f1]"
-                                  : "bg-white";
+                      const rowHighlight = highlightedStepId === step.id;
 
-                        return (
-                          <div
-                            key={step.id}
-                            id={`step-${step.id}`}
-                            className={
-                              "grid grid-cols-[36px_52px_44px_minmax(280px,360px)_150px_150px_150px_minmax(280px,1fr)_72px_72px] items-start gap-x-2 border-b border-neutral-200 px-2 py-1.5 " +
-                              rowSurface
-                            }
-                          >
-                            <div className="flex justify-center pt-1">
-                              <input
-                                type="checkbox"
-                                checked={step.checked}
-                                disabled={step.notApplicable}
-                                onChange={(e) =>
-                                  toggleStepChecked(selectedProject.id, phaseId, step.id, e.target.checked)
-                                }
-                                className="h-4 w-4 accent-blue-600 disabled:cursor-not-allowed disabled:opacity-60"
-                                aria-label={`완료: ${step.label}`}
-                              />
-                            </div>
-                            <div className="flex justify-center pt-1">
-                              <input
-                                type="checkbox"
-                                checked={step.notApplicable}
-                                onChange={(e) =>
-                                  toggleStepNotApplicable(
-                                    selectedProject.id,
-                                    phaseId,
-                                    step.id,
-                                    e.target.checked
-                                  )
-                                }
-                                className="h-4 w-4 accent-neutral-500"
-                                aria-label={`해당 없음(N/A): ${step.label}`}
-                              />
-                            </div>
-                            <div
-                              className={`pt-1 text-center tabular-nums ${
-                                isChildRow
-                                  ? "text-sm font-semibold text-neutral-300"
-                                  : "text-[15px] font-extrabold text-neutral-800"
-                              }`}
-                            >
-                              {displayIndex || "\u00a0"}
-                            </div>
-                            <div
-                              className="flex min-w-0 items-start gap-1.5 py-1 text-left text-[15px] font-medium text-neutral-900"
-                              style={isChildRow ? { paddingLeft: 8 + Math.max(0, depth - 1) * 8 } : undefined}
-                            >
-                              {step.subSteps && step.subSteps.length > 0 ? (
-                                <button
-                                  type="button"
-                                  onClick={() => toggleStepExpanded(selectedProject.id, phaseId, step.id)}
-                                  className="h-7 w-7 shrink-0 rounded-md text-sm text-neutral-500 hover:bg-neutral-200/80 hover:text-neutral-800"
-                                  aria-expanded={Boolean(step.expanded)}
-                                  aria-label={step.expanded ? "하위 접기" : "하위 펼치기"}
-                                >
-                                  {step.expanded ? "▼" : "▶"}
-                                </button>
-                              ) : (
-                                <span
-                                  className="inline-flex h-7 w-7 shrink-0 items-center justify-center text-neutral-300"
-                                  aria-hidden
-                                >
-                                  ·
-                                </span>
-                              )}
-
-                              {isChildRow ? (
-                                <span className="shrink-0 text-[12px] font-semibold text-neutral-400">└</span>
-                              ) : null}
-
-                              <span
-                                className={`min-w-0 ${
-                                  isChildRow
-                                    ? "text-[14px] font-medium text-neutral-700"
-                                    : "text-[15px] font-extrabold tracking-[-0.02em] text-neutral-900"
-                                }`}
-                                style={{
-                                  whiteSpace: "normal",
-                                  overflowWrap: "anywhere",
-                                  wordBreak: "keep-all",
-                                  lineHeight: 1.25,
-                                }}
-                              >
-                                {step.label}
-                              </span>
-
-                              {step.subSteps?.length ? (
-                                <span className="shrink-0 rounded bg-neutral-100 px-1.5 py-0.5 text-[10px] font-semibold text-neutral-500">
-                                  {step.subSteps.length}
-                                </span>
-                              ) : null}
-
-                              {step.notApplicable ? (
-                                <span className="shrink-0 rounded border border-neutral-200 bg-neutral-100/90 px-1 py-0.5 text-[10px] font-semibold text-neutral-600">
-                                  N/A
-                                </span>
-                              ) : null}
-
-                              {overdue ? (
-                                <span className="shrink-0 rounded border border-rose-200 bg-rose-50 px-1 py-0.5 text-[10px] font-semibold text-rose-700">
-                                  OVERDUE
-                                </span>
-                              ) : null}
-
-                              {!overdue && dueSoonLabel ? (
-                                <span className="shrink-0 rounded border border-emerald-300 bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800">
-                                  {dueSoonLabel}
-                                </span>
-                              ) : null}
-                            </div>
-                            <div className="rounded border border-neutral-200 px-1.5 py-1 pt-1.5">
-                              <Input
-                                type="date"
-                                value={draft.dueDate}
-                                onChange={(v) => patchStepDraft(step.id, { dueDate: v }, step)}
-                                className="text-[14px]"
-                              />
-                            </div>
-                            <div className="rounded border border-neutral-200 px-1.5 py-1 pt-1.5">
-                              <Input
-                                type="date"
-                                value={draft.confirmedAt}
-                                onChange={(v) => patchStepDraft(step.id, { confirmedAt: v }, step)}
-                                className="text-[14px]"
-                              />
-                            </div>
-                            <div className="min-w-0 pt-1">
-                              <AssigneeMultiSelect
-                                compact
-                                members={globalMembers}
-                                selectedIds={draft.assigneeMemberIds}
-                                onChange={(next) => patchStepDraft(step.id, { assigneeMemberIds: next }, step)}
-                              />
-                            </div>
-                            <div className="relative min-w-0 pt-1">
-                              <TextArea
-                                value={draft.memo}
-                                onChange={(v) => patchStepDraft(step.id, { memo: v }, step)}
-                                placeholder="@멘션 · 확인 시 저장"
-                                rows={2}
-                                className="min-h-[38px] py-1 text-[13px] leading-snug"
-                              />
-                              {mentionQuery !== null && mentionCandidates.length > 0 && (
-                                <div className="absolute left-0 right-0 top-full z-30 mt-0.5 max-h-40 overflow-y-auto rounded-lg border border-neutral-200 bg-white p-1.5 shadow-lg">
-                                  {mentionCandidates.map((member) => (
-                                    <button
-                                      key={member.id}
-                                      type="button"
-                                      onClick={() => applyMentionToDraft(step.id, member, step)}
-                                      className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-neutral-50"
-                                    >
-                                      <MemberInitial name={member.name} />
-                                      <span className="truncate font-medium">{member.name}</span>
-                                    </button>
-                                  ))}
-                                </div>
-                              )}
-                            </div>
-                            <div className="flex justify-center pt-1">
-                              <button
-                                type="button"
-                                onClick={() => resetStepDraftFields(step.id)}
-                                className="rounded-lg border border-rose-200 bg-rose-50 px-2 py-1.5 text-[10px] font-medium text-rose-700"
-                              >
-                                초기화
-                              </button>
-                            </div>
-                            <div className="flex justify-center pt-1">
-                              <button
-                                type="button"
-                                disabled={savingStepId === step.id}
-                                onClick={() => void saveStepDraft(selectedProject.id, phaseId, step.id)}
-                                className="rounded-lg border border-slate-900 bg-slate-900 px-2 py-1.5 text-[10px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
-                              >
-                                {savingStepId === step.id ? "…" : "확인"}
-                              </button>
-                            </div>
-                          </div>
-                        );
-                      })}
+                      return (
+                        <FlowchartRow
+                          key={step.id}
+                          phaseId={phaseId}
+                          step={step}
+                          depth={depth}
+                          displayIndex={displayIndex}
+                          isChildRow={isChildRow}
+                          draft={draft}
+                          mentionCandidates={mentionCandidates}
+                          rowHighlight={rowHighlight}
+                          overdue={overdue}
+                          dueSoonLabel={dueSoonLabel}
+                          selectedProjectId={selectedProject.id}
+                          members={globalMembers}
+                          savingStepId={savingStepId}
+                          attachmentsEnabled={flowchartAttachmentsEnabled}
+                          uploadingAttachment={Boolean(uploadingAttachmentStepIds[step.id])}
+                          handlers={flowchartRowHandlers}
+                        />
+                      );
+                    })}
                   </div>
                 </div>
               </section>
