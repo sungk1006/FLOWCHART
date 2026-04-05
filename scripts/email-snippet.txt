@@ -1,0 +1,68 @@
+                <section className="space-y-4">
+                  <section className="rounded-[26px] border border-neutral-200 bg-white p-4">
+                    <div className="mb-3">
+                      <div className="mb-1 text-[11px] uppercase tracking-[0.22em] text-neutral-500">Update Log</div>
+                      <h2 className="text-[20px] font-bold tracking-[-0.03em]">Email Log</h2>
+                    </div>
+
+                    <div className="space-y-3">
+                      {selectedProject.notificationLogs.length === 0 ? (
+                        <div className="rounded-2xl border border-dashed border-neutral-200 bg-[#faf9f7] px-4 py-6 text-center text-sm text-neutral-400">
+                          아직 이메일 알림 로그가 없습니다.
+                        </div>
+                      ) : (
+                        selectedProject.notificationLogs.map((log) => (
+                          <div key={log.id} className="rounded-2xl border border-neutral-200 bg-[#faf9f7] px-3 py-3">
+                            <div className="text-sm font-semibold">{log.stepLabel}</div>
+                            <div className="mt-1 text-xs text-neutral-500">{log.phaseTitle}</div>
+                            <div className="mt-2 text-xs text-neutral-600">
+                              {log.kind === "due_reminder" ? (
+                                <>
+                                  <span className="font-medium">{log.authorName}</span>
+                                  {log.recipients.length > 0
+                                    ? ` → ${log.recipients.map((r) => `${r.name} (${r.email})`).join(", ")}`
+                                    : null}
+                                </>
+                              ) : (
+                                <>
+                                  <span className="font-medium">{log.authorName}</span> mentioned{" "}
+                                  {log.recipients.map((r) => `@${r.name}`).join(", ")}
+                                </>
+                              )}
+                            </div>
+                            <div className="mt-2 text-sm text-neutral-700">{log.commentText}</div>
+                            <div className="mt-2 text-xs text-neutral-400">{log.createdAt}</div>
+                            {log.emailNotify && (
+                              <div className="mt-2 border-t border-neutral-200 pt-2 text-[11px] leading-relaxed text-neutral-600">
+                                <div
+                                  className={
+                                    log.emailNotify.overallOk ? "font-medium text-emerald-700" : "font-medium text-rose-700"
+                                  }
+                                >
+                                  이메일:{" "}
+                                  {log.emailNotify.mock ? "[MOCK] " : ""}
+                                  {log.emailNotify.overallOk ? "발송 성공" : "발송 실패"}
+                                  {log.emailNotify.attemptedAt ? ` · ${log.emailNotify.attemptedAt}` : ""}
+                                </div>
+                                {log.emailNotify.overallError ? (
+                                  <div className="mt-1 text-rose-600">{log.emailNotify.overallError}</div>
+                                ) : null}
+                                {log.emailNotify.perRecipient.some((r) => !r.ok) ? (
+                                  <ul className="mt-1 list-inside list-disc text-neutral-500">
+                                    {log.emailNotify.perRecipient
+                                      .filter((r) => !r.ok)
+                                      .map((r) => (
+                                        <li key={r.email}>
+                                          {r.name} ({r.email}){r.error ? ` — ${r.error}` : ""}
+                                        </li>
+                                      ))}
+                                  </ul>
+                                ) : null}
+                              </div>
+                            )}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </section>
+                </section>

@@ -6,7 +6,9 @@ import {
   buildDueReminderProcessRequest,
   type DueReminderJobResult,
   type DueReminderProcessResponse,
+  type DueReminderStepWireInput,
 } from "@/lib/due-reminder-email";
+import { buildFlowchartStepLink } from "@/lib/flowchart-step-link";
 import { type MentionNotifyResponse } from "@/lib/mention-email";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 
@@ -25,10 +27,24 @@ import {
   type MemberRow,
   type ProjectRow,
 } from "@/lib/sync/dashboard";
+import { CreatableSelect } from "@/components/project-dashboard/CreatableSelect";
+import { OptionManageModal } from "@/components/project-dashboard/OptionManageModal";
+import {
+  addOptionToList,
+  applyProjectFilters,
+  countOptionUsage,
+  defaultProjectFilters,
+  emptySelectOptions,
+  mergeSelectOptionsWithProjects,
+  removeOptionFromList,
+  type ProjectFilters,
+  type SelectOptionFieldKey,
+  type SelectOptions,
+} from "@/lib/project-dashboard-core";
 
 type ProjectStatus = "REVIEW" | "IN PROGRESS" | "HOLD" | "DONE" | "DRAFT";
-type SortOption = "UPDATED_DESC" | "CODE_ASC" | "CODE_DESC" | "PROGRESS_DESC";
-type FormMode = "create" | "edit";
+
+type OverviewSortOption = "CODE_ASC" | "CODE_DESC" | "UPDATED_DESC" | "PROGRESS_DESC";
 type MemberRole = "관리자" | "사용자";
 
 type Member = {
@@ -87,6 +103,8 @@ type NotificationLog = {
   stepLabel: string;
   authorName: string;
   commentText: string;
+  /** 대시보드 해당 스텝 딥링크 (?project=&step=) */
+  stepLink?: string;
   recipients: Mention[];
   createdAt: string;
   /** 멘션 메일 발송 시도 결과 (멘션이 없으면 생략) */
@@ -103,13 +121,25 @@ type Step = {
   id: string;
   label: string;
   checked: boolean;
+  /** 해당 없음 → 자동 완료(checked) 처리 */
+  notApplicable: boolean;
   dueDate: string;
   /** 마감 24시간 전 알림 발송 시각(ISO). 비어 있으면 미발송 */
   dueReminderSentAt: string;
   confirmedAt: string;
   memo: string;
-  assigneeMemberId: string;
+  assigneeMemberIds: string[];
   comments: StepComment[];
+  /** 하위 스텝이 있을 때만 — 플로우차트에서 펼침 여부 */
+  expanded?: boolean;
+  subSteps?: Step[];
+};
+
+type StepEditorDraft = {
+  dueDate: string;
+  confirmedAt: string;
+  memo: string;
+  assigneeMemberIds: string[];
 };
 
 type Phase = {
@@ -124,9 +154,28 @@ type Project = {
   code: string;
   status: ProjectStatus;
   country: string;
+  certificate: string;
   exporter: string;
   item: string;
   client: string;
+  businessModel: string;
+  incoterms: string;
+  hsCode: string;
+  customRate: string;
+  vatRate: string;
+
+  etd: string;
+  eta: string;
+
+  priceValue: string;
+  priceCurrency: "USD" | "KRW";
+  priceUnit: "KG" | "LB" | "UNIT";
+  offerPriceValue: string;
+  offerPriceCurrency: "USD" | "KRW";
+  offerPriceUnit: "KG" | "LB" | "UNIT";
+  finalPriceValue: string;
+  finalPriceCurrency: "USD" | "KRW";
+  finalPriceUnit: "KG" | "LB" | "UNIT";
   note: string;
   updated: boolean;
   lastChangedAt: string;
@@ -134,20 +183,45 @@ type Project = {
   notificationLogs: NotificationLog[];
 };
 
-type ProjectForm = {
+type ProjectHeaderDraft = {
   code: string;
   status: ProjectStatus;
   country: string;
+  certificate: string;
+  businessModel: string;
+  incoterms: string;
   exporter: string;
-  item: string;
   client: string;
-  note: string;
+  item: string;
+  hsCode: string;
+  customRate: string;
+  vatRate: string;
+
+  etd: string;
+  eta: string;
+
+  priceValue: string;
+  priceCurrency: "USD" | "KRW";
+  priceUnit: "KG" | "LB" | "UNIT";
+  offerPriceValue: string;
+  offerPriceCurrency: "USD" | "KRW";
+  offerPriceUnit: "KG" | "LB" | "UNIT";
+  finalPriceValue: string;
+  finalPriceCurrency: "USD" | "KRW";
+  finalPriceUnit: "KG" | "LB" | "UNIT";
 };
 
 type PersistedState = {
   projects: Project[];
   selectedId: string;
   globalMembers: Member[];
+  sidebarFilters?: ProjectFilters;
+  detailFilters?: ProjectFilters;
+  sidebarSearch?: string;
+  detailSearch?: string;
+  /** @deprecated 호환용 — 없으면 무시 */
+  projectFilters?: ProjectFilters;
+  selectOptions?: SelectOptions;
 };
 
 function parsePersistedJson(raw: string): Partial<PersistedState> | null {
@@ -217,15 +291,6 @@ function normalizeStoredProjects(raw: unknown): Project[] {
   return out;
 }
 
-const ITEM_OPTIONS = [
-  "GREEN BEAN",
-  "INSTANT COFFEE",
-  "DECAF GREEN",
-  "TEA EXTRACT",
-  "TEMPLATE",
-  "OTHER",
-];
-
 function createId(prefix = "id") {
   return `${prefix}-${Math.random().toString(36).slice(2, 10)}-${Date.now()}`;
 }
@@ -240,39 +305,113 @@ function nowString() {
   return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
 }
 
-function toDatetimeLocal(date: Date) {
-  const offset = date.getTimezoneOffset();
-  const local = new Date(date.getTime() - offset * 60 * 1000);
-  return local.toISOString().slice(0, 16);
+function todayLocalDate() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
 
-function isoNowLocal() {
-  return toDatetimeLocal(new Date());
-}
-
-function parseDateSafe(value: string) {
+function parseLocalDate(value: string) {
   if (!value) return null;
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return null;
-  return d;
+  const m = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]) - 1;
+  const day = Number(m[3]);
+  const date = new Date(y, mo, day);
+  if (Number.isNaN(date.getTime())) return null;
+  return date;
+}
+
+function endOfLocalDay(date: Date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59, 999);
 }
 
 function isOverdue(value: string) {
-  const d = parseDateSafe(value);
+  const d = parseLocalDate(value);
   if (!d) return false;
-  return d.getTime() < Date.now();
+  return endOfLocalDay(d).getTime() < Date.now();
 }
 
-function emptyForm(): ProjectForm {
+function getDaysUntilDue(value: string) {
+  const d = parseLocalDate(value);
+  if (!d) return null;
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const due = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  return Math.round((due.getTime() - today.getTime()) / 86400000);
+}
+
+function getDueSoonLabel(value: string) {
+  const days = getDaysUntilDue(value);
+  if (days == null) return null;
+  if (days >= 1 && days <= 3) return `D-${days}`;
+  return null;
+}
+
+function normalizeDateOnly(value: string) {
+  if (!value) return "";
+  const m = value.match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1]! : "";
+}
+
+function stepToDraft(step: Step): StepEditorDraft {
   return {
-    code: "",
-    status: "DRAFT",
-    country: "",
-    exporter: "",
-    item: "GREEN BEAN",
-    client: "",
-    note: "",
+    dueDate: step.dueDate,
+    confirmedAt: step.confirmedAt,
+    memo: step.memo,
+    assigneeMemberIds: [...step.assigneeMemberIds],
   };
+}
+
+function idSetsEqual(a: string[], b: string[]) {
+  if (a.length !== b.length) return false;
+  const sa = [...a].sort();
+  const sb = [...b].sort();
+  return sa.every((v, i) => v === sb[i]);
+}
+
+function extractMentionsFromText(text: string, members: Member[]): Mention[] {
+  return members
+    .filter((member) => text.includes(`@${member.name}`))
+    .map((member) => ({
+      memberId: member.id,
+      name: member.name,
+      email: member.email,
+    }));
+}
+
+function buildNotificationRecipients(memo: string, assigneeMemberIds: string[], members: Member[]): Mention[] {
+  const mentionRecipients = extractMentionsFromText(memo, members);
+  const assigneeRecipients = assigneeMemberIds
+    .map((id) => members.find((m) => m.id === id))
+    .filter((m): m is Member => Boolean(m))
+    .map((m) => ({
+      memberId: m.id,
+      name: m.name,
+      email: m.email,
+    }));
+
+  const merged = [...mentionRecipients, ...assigneeRecipients];
+  const seen = new Set<string>();
+  return merged.filter((r) => {
+    const key = (r.memberId || r.email || "").trim().toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildAssigneeSummary(members: Member[], ids: string[]): string {
+  if (!ids.length) return "미지정";
+  const names = ids
+    .map((id) => members.find((m) => m.id === id)?.name)
+    .filter((n): n is string => Boolean(n?.trim()));
+  if (!names.length) return "미지정";
+  if (names.length === 1) return names[0]!;
+  return `${names[0]!} 외 ${names.length - 1}명`;
 }
 
 function createStep(label: string): Step {
@@ -280,51 +419,418 @@ function createStep(label: string): Step {
     id: createId("step"),
     label,
     checked: false,
+    notApplicable: false,
     dueDate: "",
     dueReminderSentAt: "",
     confirmedAt: "",
     memo: "",
-    assigneeMemberId: "",
+    assigneeMemberIds: [],
     comments: [],
   };
 }
 
-function createPhase(title: string, stepLabels: string[], expanded = false): Phase {
+const NEW_PRODUCT_SUB_LABELS = [
+  "1-1 SPEC",
+  "1-2 INGREDIENT LIST",
+  "1-3 NUTRITIONAL FACT",
+  "1-4 FLOW CHART",
+  "1-5 MOQ",
+  "1-6 PACKING UNIT",
+  "1-7 Palletlizing",
+  "1-8 Storage",
+] as const;
+
+const IMPORT_AVAILABILITY_SUB_LABELS = [
+  "2-1 국내실적 확인",
+  "2-2 인증정보 확인",
+  "2-3 해외 제조업소 등록여부 체크",
+] as const;
+
+const PRICING_SUB_LABELS = [
+  "3-1 수출자 오퍼가격 확인",
+  "3-2 ORDER PRICE 체크",
+  "3-3 CLIENT 오퍼가격 확인",
+] as const;
+
+const OVERSEAS_ORDER_SUB_LABELS = [
+  "4-1 PO",
+  "4-2 선입금",
+  "4-3 수입/수입대행계약서",
+] as const;
+
+const PSS_TEST_SUB_LABELS = [
+  "5-1 샘플요청",
+  "5-2 통관요청",
+  "5-3 샘플수령",
+  "5-4 샘플테스트",
+  "5-5 결과전달",
+] as const;
+
+const PACKING_LABEL_SUB_LABELS = [
+  "6-1 packing 디자인 확인",
+  "6-2 영어라벨 확인",
+  "6-3 한글라벨 확인",
+  "6-4 부착사진 확인",
+] as const;
+
+const BOOKING_SUB_LABELS = [
+  "7-1 선사 운임 요청",
+  "7-2 SC 확인 및 전달",
+  "7-3 BOOKING CONFIRMATION",
+  "7-4 L/C",
+] as const;
+
+const SHIPPING_DOCUMENT_SUB_LABELS = [
+  "8-1 BL",
+  "8-2 INVOICE",
+  "8-3 PACKING LIST",
+  "8-4 COO",
+  "8-5 CO",
+  "8-6 ICO",
+  "8-7 COA",
+  "8-8 QUALITY CERTIFICATE",
+  "8-9 TC",
+  "8-10 PESTICIDE RESIDUE",
+  "8-11 OCHRATOXIN",
+  "8-12 AFLATOXIN",
+  "8-13 INSURANCE",
+] as const;
+
+const PAYMENT_SUB_LABELS = [
+  "9-1 선입금",
+  "9-2 CP",
+  "9-3 송금",
+] as const;
+
+const ARRIVAL_SUB_LABELS = [
+  "10-1 운임인보이스",
+  "10-2 DO",
+  "10-3 FREE TIME",
+  "10-4 검색기",
+  "10-5 디탠션",
+  "10-6 디머리지",
+] as const;
+
+const INSPECTION_TRANSPORT_SUB_LABELS = [
+  "11-1 보세운송",
+  "11-2 검역",
+] as const;
+
+const CUSTOMS_CLEARANCE_SUB_LABELS = [
+  "12-1 수입신고견본확인",
+  "12-2 통관비용 청구서 확인 및 통관비 입금",
+  "12-3 통관요청 및 통관확인",
+  "12-4 통관서류 확인",
+] as const;
+
+const WAREHOUSING_SUB_LABELS = [
+  "13-1 입고일정 및 입고지 확인",
+  "13-2 입고",
+] as const;
+
+const FEEDBACK_NEXT_ORDER_SUB_LABELS = [
+  "15-1 클레임 확인",
+  "15-2 수출업체 클레임 요청",
+  "15-3 피드백 전달",
+  "15-4 다음 오더일 체크",
+] as const;
+
+function createParentStep(label: string, subLabels: readonly string[]): Step {
   return {
-    id: createId("phase"),
-    title,
-    expanded,
-    steps: stepLabels.map((label) => createStep(label)),
+    ...createStep(label),
+    expanded: false,
+    subSteps: subLabels.map((subLabel) => createStep(subLabel)),
   };
+}
+
+function flattenStepsDeep(steps: Step[]): Step[] {
+  const out: Step[] = [];
+  for (const s of steps) {
+    out.push(s);
+    if (s.subSteps?.length) out.push(...flattenStepsDeep(s.subSteps));
+  }
+  return out;
+}
+
+function areAllNestedChildrenComplete(step: Step): boolean {
+  if (!step.subSteps?.length) return true;
+  return step.subSteps.every((sub) => {
+    const selfDone = sub.checked || sub.notApplicable;
+    return selfDone && areAllNestedChildrenComplete(sub);
+  });
+}
+
+function reconcileParentCheckFromChildren(step: Step): Step {
+  if (!step.subSteps?.length) return step;
+
+  const nextSubSteps = step.subSteps.map(reconcileParentCheckFromChildren);
+  const allDone = nextSubSteps.every(
+    (sub) => (sub.checked || sub.notApplicable) && areAllNestedChildrenComplete(sub)
+  );
+
+  const nextChecked = step.notApplicable ? true : allDone;
+  const nextConfirmedAt = nextChecked
+    ? step.confirmedAt?.trim()
+      ? step.confirmedAt
+      : todayLocalDate()
+    : "";
+
+  return {
+    ...step,
+    subSteps: nextSubSteps,
+    checked: nextChecked,
+    confirmedAt: nextConfirmedAt,
+  };
+}
+
+function reconcilePhaseSteps(steps: Step[]): Step[] {
+  return steps.map(reconcileParentCheckFromChildren);
+}
+
+function autoCheckStepByLabelInTree(
+  steps: Step[],
+  targetLabel: string,
+  confirmedAtValue: string
+): Step[] {
+  return steps.map((step) => {
+    let next = step;
+
+    if (step.label === targetLabel && !step.checked) {
+      next = {
+        ...step,
+        checked: true,
+        confirmedAt: step.confirmedAt?.trim() ? step.confirmedAt : confirmedAtValue,
+        dueReminderSentAt: "",
+      };
+    }
+
+    if (next.subSteps?.length) {
+      return {
+        ...next,
+        subSteps: autoCheckStepByLabelInTree(next.subSteps, targetLabel, confirmedAtValue),
+      };
+    }
+
+    return next;
+  });
+}
+
+function autoCheckProjectStepByLabel(
+  project: Project,
+  targetLabel: string,
+  confirmedAtValue: string,
+  timestamp: string
+): Project {
+  let touched = false;
+
+  const nextPhases = project.phases.map((phase) => {
+    let phaseTouched = false;
+
+    const nextSteps = reconcilePhaseSteps(
+      autoCheckStepByLabelInTree(phase.steps, targetLabel, confirmedAtValue).map((step, index) => {
+        const prevStep = phase.steps[index];
+        if (step !== prevStep) {
+          phaseTouched = true;
+        }
+        return step;
+      })
+    );
+
+    if (phaseTouched) {
+      touched = true;
+      return { ...phase, steps: nextSteps };
+    }
+
+    return phase;
+  });
+
+  if (!touched) return project;
+
+  return {
+    ...project,
+    phases: nextPhases,
+    updated: true,
+    lastChangedAt: timestamp,
+  };
+}
+
+function forEachStepInTree(steps: Step[], fn: (s: Step) => void) {
+  for (const s of steps) {
+    fn(s);
+    if (s.subSteps?.length) forEachStepInTree(s.subSteps, fn);
+  }
+}
+
+function stepIdExistsInSteps(steps: Step[], stepId: string): boolean {
+  for (const s of steps) {
+    if (s.id === stepId) return true;
+    if (s.subSteps?.length && stepIdExistsInSteps(s.subSteps, stepId)) return true;
+  }
+  return false;
+}
+
+function findStepInPhaseSteps(steps: Step[], stepId: string): Step | undefined {
+  for (const s of steps) {
+    if (s.id === stepId) return s;
+    if (s.subSteps?.length) {
+      const f = findStepInPhaseSteps(s.subSteps, stepId);
+      if (f) return f;
+    }
+  }
+  return undefined;
+}
+
+function patchStepInTree(steps: Step[], stepId: string, patcher: (s: Step) => Step): Step[] {
+  return steps.map((step) => {
+    if (step.id === stepId) return patcher(step);
+    if (step.subSteps?.length) {
+      return { ...step, subSteps: patchStepInTree(step.subSteps, stepId, patcher) };
+    }
+    return step;
+  });
+}
+
+function removeMemberFromStepTree(step: Step, memberId: string): Step {
+  const next: Step = {
+    ...step,
+    assigneeMemberIds: step.assigneeMemberIds.filter((id) => id !== memberId),
+  };
+  if (!step.subSteps?.length) return next;
+  return { ...next, subSteps: step.subSteps.map((s) => removeMemberFromStepTree(s, memberId)) };
+}
+
+function stepToDueReminderInput(s: Step): DueReminderStepWireInput {
+  return {
+    id: s.id,
+    label: s.label,
+    checked: s.checked,
+    dueDate: s.dueDate,
+    assigneeMemberIds: s.assigneeMemberIds,
+    dueReminderSentMap: {},
+    subSteps: s.subSteps?.map(stepToDueReminderInput),
+  };
+}
+
+type FlowchartVisibleRow = {
+  phaseId: string;
+  step: Step;
+  depth: number;
+  /** depth 0일 때 전체 플로우차트 기준으로 증가하는 메인 단계 번호 */
+  mainIndex: number;
+  isChildRow: boolean;
+  /** 메인 행만 "1","2",… — 하위 행은 빈 문자열(라벨에 1-1 등이 있음) */
+  displayIndex: string;
+};
+
+function buildPhaseVisibleRows(
+  phase: Phase,
+  startMainIndex: number
+): { rows: FlowchartVisibleRow[]; nextMainIndex: number } {
+  const rows: FlowchartVisibleRow[] = [];
+  let mainCounter = startMainIndex;
+
+  function walk(list: Step[], depth: number) {
+    for (const step of list) {
+      if (depth === 0) {
+        mainCounter += 1;
+        rows.push({
+          phaseId: phase.id,
+          step,
+          depth,
+          mainIndex: mainCounter,
+          isChildRow: false,
+          displayIndex: String(mainCounter),
+        });
+      } else {
+        rows.push({
+          phaseId: phase.id,
+          step,
+          depth,
+          mainIndex: mainCounter,
+          isChildRow: true,
+          displayIndex: "",
+        });
+      }
+
+      if (step.subSteps?.length && step.expanded) {
+        walk(step.subSteps, depth + 1);
+      }
+    }
+  }
+
+  walk(phase.steps, 0);
+
+  return {
+    rows,
+    nextMainIndex: mainCounter,
+  };
+}
+
+function buildAllFlowchartVisibleRows(phases: Phase[]): FlowchartVisibleRow[] {
+  const out: FlowchartVisibleRow[] = [];
+  let cursor = 0;
+
+  for (const phase of phases) {
+    const built = buildPhaseVisibleRows(phase, cursor);
+    out.push(...built.rows);
+    cursor = built.nextMainIndex;
+  }
+
+  return out;
 }
 
 function createFixedFlowchartPhases(): Phase[] {
   return [
-    createPhase("PHASE 1 — Planning", [
-      "1. Business Model Check",
-      "2. Import Availability",
-      "3. Pricing",
-    ]),
-    createPhase("PHASE 2 — Ordering", [
-      "4. Overseas Order",
-      "5. PSS Test",
-      "6. Packing & Label",
-    ]),
-    createPhase("PHASE 3 — Shipping", [
-      "7. Booking",
-      "8. Shipping Document",
-      "9. Payment",
-    ]),
-    createPhase("PHASE 4 — Clearance", [
-      "10. Arrival",
-      "11. Inspection",
-      "12. Clearance",
-    ]),
-    createPhase("PHASE 5 — Closing", [
-      "13. Warehouse",
-      "14. Invoice",
-      "15. Feedback",
-    ]),
+    {
+      id: createId("phase"),
+      title: "PHASE 1 — Planning",
+      expanded: false,
+      steps: [
+        createParentStep("NEW PRODUCT", NEW_PRODUCT_SUB_LABELS),
+        createParentStep("Import Availability", IMPORT_AVAILABILITY_SUB_LABELS),
+        createParentStep("Pricing", PRICING_SUB_LABELS),
+      ],
+    },
+    {
+      id: createId("phase"),
+      title: "PHASE 2 — Ordering",
+      expanded: false,
+      steps: [
+        createParentStep("Overseas Order", OVERSEAS_ORDER_SUB_LABELS),
+        createParentStep("PSS Test", PSS_TEST_SUB_LABELS),
+        createParentStep("Packing & Label", PACKING_LABEL_SUB_LABELS),
+      ],
+    },
+    {
+      id: createId("phase"),
+      title: "PHASE 3 — Shipping",
+      expanded: false,
+      steps: [
+        createParentStep("Booking", BOOKING_SUB_LABELS),
+        createParentStep("Shipping Document", SHIPPING_DOCUMENT_SUB_LABELS),
+        createParentStep("Payment", PAYMENT_SUB_LABELS),
+      ],
+    },
+    {
+      id: createId("phase"),
+      title: "PHASE 4 — Clearance",
+      expanded: false,
+      steps: [
+        createParentStep("Arrival", ARRIVAL_SUB_LABELS),
+        createParentStep("Inspection / container Transport", INSPECTION_TRANSPORT_SUB_LABELS),
+        createParentStep("Customs Clearance", CUSTOMS_CLEARANCE_SUB_LABELS),
+      ],
+    },
+    {
+      id: createId("phase"),
+      title: "PHASE 5 — Closing",
+      expanded: false,
+      steps: [
+        createParentStep("Warehousing", WAREHOUSING_SUB_LABELS),
+        createStep("Settlement"),
+        createParentStep("Feedback / Next Order Plan", FEEDBACK_NEXT_ORDER_SUB_LABELS),
+      ],
+    },
   ];
 }
 
@@ -336,43 +842,161 @@ function projectFromStorage(raw: unknown): Project {
 }
 
 function sanitizeAssigneesAgainstMembers(projects: Project[], validMemberIds: Set<string>): Project[] {
+  function sanitizeStep(step: Step): Step {
+    const base: Step = {
+      ...step,
+      assigneeMemberIds: step.assigneeMemberIds.filter((id) => validMemberIds.has(id)),
+    };
+    if (!step.subSteps?.length) return base;
+    return { ...base, subSteps: step.subSteps.map((s) => sanitizeStep(s)) };
+  }
   return projects.map((project) => ({
     ...project,
     phases: project.phases.map((phase) => ({
       ...phase,
-      steps: phase.steps.map((step) =>
-        step.assigneeMemberId && !validMemberIds.has(step.assigneeMemberId)
-          ? { ...step, assigneeMemberId: "" }
-          : step
-      ),
+      steps: phase.steps.map((step) => sanitizeStep(step)),
     })),
   }));
 }
 
+/** 저장본 "1. Business Model Check" 등에서 앞 번호·점·공백 제거 */
+function stripLeadingStepNumberFromLabel(raw: string): string {
+  return raw.replace(/^\d{1,2}\.\s*/, "").trim();
+}
+
 function normalizeStepFromStorage(step: Step): Step {
+  const r = step as unknown as Record<string, unknown>;
+  let assigneeMemberIds: string[] = [];
+  const arr = r.assigneeMemberIds;
+  if (Array.isArray(arr)) {
+    assigneeMemberIds = arr
+      .filter((x): x is string => typeof x === "string")
+      .map((x) => x.trim())
+      .filter(Boolean);
+  }
+  const legacy = r.assigneeMemberId;
+  if (assigneeMemberIds.length === 0 && typeof legacy === "string" && legacy.trim()) {
+    assigneeMemberIds = [legacy.trim()];
+  }
+  const commentsRaw = r.comments;
+  const comments = Array.isArray(commentsRaw) ? (commentsRaw as StepComment[]) : [];
+  let label = stripLeadingStepNumberFromLabel(String((step as Step).label ?? ""));
+  if (label === "Invoice" || /^invoice$/i.test(label)) {
+    label = "Settlement";
+  }
+  if (label === "Business Model Check") {
+    label = "NEW PRODUCT";
+  }
+  if (label === "Inspection / Inland Transport") {
+    label = "Inspection / container Transport";
+  }
+
+  const subsRaw = r.subSteps;
+  let subSteps: Step[] | undefined;
+  if (Array.isArray(subsRaw)) {
+    subSteps = subsRaw.map((x) => normalizeStepFromStorage(x as Step));
+  }
+  const finalSubs = subSteps && subSteps.length > 0 ? subSteps : undefined;
+
+  const s = step as Step;
+  return {
+    id: s.id,
+    label,
+    checked: Boolean(s.checked ?? false),
+    notApplicable: Boolean(s.notApplicable ?? false),
+    dueDate: normalizeDateOnly(String(s.dueDate ?? "")),
+    confirmedAt: normalizeDateOnly(String(s.confirmedAt ?? "")),
+    dueReminderSentAt: String(s.dueReminderSentAt ?? ""),
+    memo: typeof s.memo === "string" ? s.memo : "",
+    assigneeMemberIds,
+    comments,
+    expanded: finalSubs ? Boolean(s.expanded) : undefined,
+    subSteps: finalSubs,
+  };
+}
+
+function ensureDefaultSubStepsForMainLabel(step: Step): Step {
+  const map: Record<string, readonly string[]> = {
+    "NEW PRODUCT": NEW_PRODUCT_SUB_LABELS,
+    "Import Availability": IMPORT_AVAILABILITY_SUB_LABELS,
+    Pricing: PRICING_SUB_LABELS,
+    "Overseas Order": OVERSEAS_ORDER_SUB_LABELS,
+    "PSS Test": PSS_TEST_SUB_LABELS,
+    "Packing & Label": PACKING_LABEL_SUB_LABELS,
+    Booking: BOOKING_SUB_LABELS,
+    "Shipping Document": SHIPPING_DOCUMENT_SUB_LABELS,
+    Payment: PAYMENT_SUB_LABELS,
+    Arrival: ARRIVAL_SUB_LABELS,
+    "Inspection / container Transport": INSPECTION_TRANSPORT_SUB_LABELS,
+    "Inspection / Inland Transport": INSPECTION_TRANSPORT_SUB_LABELS,
+    "Customs Clearance": CUSTOMS_CLEARANCE_SUB_LABELS,
+    Warehousing: WAREHOUSING_SUB_LABELS,
+    "Feedback / Next Order Plan": FEEDBACK_NEXT_ORDER_SUB_LABELS,
+  };
+
+  const expected = map[step.label];
+  if (!expected) return step;
+  if (step.subSteps?.length) return step;
+
   return {
     ...step,
-    dueReminderSentAt: step.dueReminderSentAt ?? "",
+    expanded: false,
+    subSteps: expected.map((lbl) => createStep(lbl)),
   };
 }
 
 function normalizePhasesFromStorage(phases: Phase[]): Phase[] {
+  // Order-based renames (e.g. flatten index 13) are unsafe: deep preorder index tracks
+  // substeps, so the Nth flattened node is not the Nth main row. Settlement belongs only
+  // on the Closing phase leaf from createFixedFlowchartPhases; legacy "Invoice" →
+  // "Settlement" is handled in normalizeStepFromStorage per step.
   return phases.map((phase) => ({
     ...phase,
-    steps: phase.steps.map(normalizeStepFromStorage),
+    steps: reconcilePhaseSteps(
+      phase.steps.map((step) => ensureDefaultSubStepsForMainLabel(normalizeStepFromStorage(step)))
+    ),
   }));
 }
 
-function makeProject(data?: Partial<Project>): Project {
+function buildFlowchartStepDeepLink(projectId: string, stepId: string): string {
+  if (typeof window === "undefined") return "";
+  return buildFlowchartStepLink(`${window.location.origin}${window.location.pathname}`, projectId, stepId);
+}
+
+function makeProject(data?: Partial<Project & { dutyRate?: string }>): Project {
+  const raw = data as (Partial<Project> & { dutyRate?: string }) | undefined;
   const rawPhases = data?.phases ?? createFixedFlowchartPhases();
+  const pc = raw?.priceCurrency;
+  const oc = raw?.offerPriceCurrency;
+  const fc = raw?.finalPriceCurrency;
+  const pu = raw?.priceUnit;
+  const ou = raw?.offerPriceUnit;
+  const fu = raw?.finalPriceUnit;
   return {
     id: data?.id ?? createId("project"),
     code: data?.code ?? "DRAFT",
     status: data?.status ?? "DRAFT",
     country: data?.country ?? "",
+    certificate: data?.certificate ?? "",
     exporter: data?.exporter ?? "",
     item: data?.item ?? "GREEN BEAN",
     client: data?.client ?? "",
+    businessModel: data?.businessModel ?? "",
+    incoterms: data?.incoterms ?? "",
+    hsCode: data?.hsCode ?? "",
+    customRate: raw?.customRate ?? raw?.dutyRate ?? "",
+    vatRate: data?.vatRate ?? "",
+    etd: data?.etd ?? "",
+    eta: data?.eta ?? "",
+    priceValue: data?.priceValue ?? "",
+    priceCurrency: pc === "KRW" ? "KRW" : "USD",
+    priceUnit: pu === "LB" || pu === "UNIT" ? pu : "KG",
+    offerPriceValue: data?.offerPriceValue ?? "",
+    offerPriceCurrency: oc === "KRW" ? "KRW" : "USD",
+    offerPriceUnit: ou === "LB" || ou === "UNIT" ? ou : "KG",
+    finalPriceValue: data?.finalPriceValue ?? "",
+    finalPriceCurrency: fc === "KRW" ? "KRW" : "USD",
+    finalPriceUnit: fu === "LB" || fu === "UNIT" ? fu : "KG",
     note: data?.note ?? "",
     updated: data?.updated ?? true,
     lastChangedAt: data?.lastChangedAt ?? nowString(),
@@ -389,16 +1013,16 @@ const initialProjects: Project[] = [
 ];
 
 function getProjectProgress(project: Project) {
-  const steps = project.phases.flatMap((phase) => phase.steps);
-  const total = steps.length;
-  const done = steps.filter((step) => step.checked).length;
+  const mainSteps = project.phases.flatMap((phase) => phase.steps);
+  const total = mainSteps.length;
+  const done = mainSteps.filter((step) => step.checked).length;
   const percent = total === 0 ? 0 : Math.round((done / total) * 100);
   return { total, done, percent };
 }
 
 function getNextDueStep(project: Project) {
   const steps = project.phases.flatMap((phase) =>
-    phase.steps
+    flattenStepsDeep(phase.steps)
       .filter((step) => !step.checked && step.dueDate)
       .map((step) => ({
         phaseTitle: phase.title,
@@ -409,28 +1033,33 @@ function getNextDueStep(project: Project) {
   if (!steps.length) return null;
 
   return steps.sort((a, b) => {
-    const aTime = parseDateSafe(a.dueDate)?.getTime() ?? Infinity;
-    const bTime = parseDateSafe(b.dueDate)?.getTime() ?? Infinity;
+    const aTime = parseLocalDate(a.dueDate)?.getTime() ?? Infinity;
+    const bTime = parseLocalDate(b.dueDate)?.getTime() ?? Infinity;
     return aTime - bTime;
   })[0];
 }
 
 function getOverdueCount(project: Project) {
   return project.phases
-    .flatMap((phase) => phase.steps)
+    .flatMap((phase) => flattenStepsDeep(phase.steps))
     .filter((step) => !step.checked && step.dueDate && isOverdue(step.dueDate)).length;
 }
 
-function getPhaseOverdueCount(phase: Phase) {
-  return phase.steps.filter((step) => !step.checked && step.dueDate && isOverdue(step.dueDate)).length;
-}
-
-function badgeStyle(status: ProjectStatus) {
-  if (status === "REVIEW") return "border-violet-200 bg-violet-50 text-violet-700";
-  if (status === "IN PROGRESS") return "border-blue-200 bg-blue-50 text-blue-700";
-  if (status === "HOLD") return "border-amber-200 bg-amber-50 text-amber-700";
-  if (status === "DONE") return "border-emerald-200 bg-emerald-50 text-emerald-700";
-  return "border-neutral-200 bg-neutral-100 text-neutral-700";
+function ProjectProgressRow({ project }: { project: Project }) {
+  const pr = getProjectProgress(project);
+  return (
+    <div className="mt-2 space-y-1">
+      <div className="flex items-center justify-between text-[11px] text-neutral-600">
+        <span>
+          {pr.done}/{pr.total}
+        </span>
+        <span>{pr.percent}%</span>
+      </div>
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-neutral-200">
+        <div className="h-full rounded-full bg-neutral-900" style={{ width: `${pr.percent}%` }} />
+      </div>
+    </div>
+  );
 }
 
 function itemPillStyle(item: string) {
@@ -442,6 +1071,351 @@ function itemPillStyle(item: string) {
   return "bg-neutral-100 text-neutral-700";
 }
 
+const STATUS_FILTER_OPTIONS: ProjectStatus[] = ["REVIEW", "IN PROGRESS", "HOLD", "DONE", "DRAFT"];
+
+type ExplorerStrField = "item" | "country" | "businessModel" | "incoterms" | "exporter" | "client";
+
+const STR_FIELD_TO_OPTIONS_KEY: Record<ExplorerStrField, SelectOptionFieldKey> = {
+  item: "items",
+  country: "countries",
+  businessModel: "businessModels",
+  incoterms: "incoterms",
+  exporter: "exporters",
+  client: "clients",
+};
+
+function mergedChoicesForFilter(projects: Project[], selectOptions: SelectOptions, field: ExplorerStrField): string[] {
+  const ok = STR_FIELD_TO_OPTIONS_KEY[field];
+  const fromOpts = [...selectOptions[ok]];
+  const fromProj = new Set<string>();
+  for (const p of projects) {
+    const raw =
+      field === "item"
+        ? p.item
+        : field === "country"
+          ? p.country
+          : field === "businessModel"
+            ? p.businessModel
+            : field === "incoterms"
+              ? p.incoterms
+              : field === "exporter"
+                ? p.exporter
+                : p.client;
+    const t = raw?.trim();
+    if (t) fromProj.add(t);
+  }
+  return Array.from(new Set([...fromOpts, ...fromProj])).sort((a, b) =>
+    a.localeCompare(b, undefined, { sensitivity: "base" })
+  );
+}
+
+function filterSummaryLabel(selected: string[]): string {
+  if (selected.length === 0) return "ALL";
+  if (selected.length === 1) return selected[0]!;
+  return `${selected.length} selected`;
+}
+
+function MultiSelectDropdown({
+  label,
+  options,
+  selected,
+  onToggle,
+}: {
+  label: string;
+  options: string[];
+  selected: string[];
+  onToggle: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handle(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, [open]);
+
+  return (
+    <div ref={ref} className="relative min-w-[130px] flex-1 sm:max-w-[220px]">
+      <div className="mb-1 text-[10px] uppercase tracking-[0.16em] text-neutral-500">{label}</div>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between gap-2 rounded-xl border border-neutral-200 bg-white px-3 py-2 text-left text-sm"
+      >
+        <span className="truncate">{filterSummaryLabel(selected)}</span>
+        <span className="shrink-0 text-neutral-400">{open ? "▲" : "▼"}</span>
+      </button>
+      {open ? (
+        <div className="absolute left-0 right-0 z-40 mt-1 max-h-56 overflow-y-auto rounded-xl border border-neutral-200 bg-white p-2 shadow-lg">
+          {options.length === 0 ? (
+            <div className="px-2 py-2 text-xs text-neutral-400">옵션 없음</div>
+          ) : (
+            options.map((opt) => (
+              <label
+                key={opt}
+                className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-neutral-50"
+              >
+                <input type="checkbox" checked={selected.includes(opt)} onChange={() => onToggle(opt)} />
+                <span className="min-w-0 break-all">{opt}</span>
+              </label>
+            ))
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function StatusMultiDropdown({
+  selected,
+  onToggle,
+}: {
+  selected: ProjectStatus[];
+  onToggle: (value: ProjectStatus) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handle(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, [open]);
+
+  const selStr = selected as string[];
+
+  return (
+    <div ref={ref} className="relative min-w-[130px] flex-1 sm:max-w-[220px]">
+      <div className="mb-1 text-[10px] uppercase tracking-[0.16em] text-neutral-500">STATUS</div>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between gap-2 rounded-xl border border-neutral-200 bg-white px-3 py-2 text-left text-sm"
+      >
+        <span className="truncate">{filterSummaryLabel(selStr)}</span>
+        <span className="shrink-0 text-neutral-400">{open ? "▲" : "▼"}</span>
+      </button>
+      {open ? (
+        <div className="absolute left-0 right-0 z-40 mt-1 max-h-56 overflow-y-auto rounded-xl border border-neutral-200 bg-white p-2 shadow-lg">
+          {STATUS_FILTER_OPTIONS.map((st) => (
+            <label
+              key={st}
+              className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-neutral-50"
+            >
+              <input type="checkbox" checked={selected.includes(st)} onChange={() => onToggle(st)} />
+              <span>{st}</span>
+            </label>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ProjectExplorerFilterBar({
+  projects,
+  selectOptions,
+  detailSearch,
+  setDetailSearch,
+  detailFilters,
+  toggleDetailFilterValue,
+  overviewSortBy,
+  setOverviewSortBy,
+}: {
+  projects: Project[];
+  selectOptions: SelectOptions;
+  detailSearch: string;
+  setDetailSearch: (v: string) => void;
+  detailFilters: ProjectFilters;
+  toggleDetailFilterValue: (field: keyof ProjectFilters, value: string | ProjectStatus) => void;
+  overviewSortBy: OverviewSortOption;
+  setOverviewSortBy: (v: OverviewSortOption) => void;
+}) {
+  const itemChoices = useMemo(() => mergedChoicesForFilter(projects, selectOptions, "item"), [projects, selectOptions]);
+  const countryChoices = useMemo(() => mergedChoicesForFilter(projects, selectOptions, "country"), [projects, selectOptions]);
+  const bmChoices = useMemo(
+    () => mergedChoicesForFilter(projects, selectOptions, "businessModel"),
+    [projects, selectOptions]
+  );
+  const incChoices = useMemo(() => mergedChoicesForFilter(projects, selectOptions, "incoterms"), [projects, selectOptions]);
+  const expChoices = useMemo(() => mergedChoicesForFilter(projects, selectOptions, "exporter"), [projects, selectOptions]);
+  const clientChoices = useMemo(() => mergedChoicesForFilter(projects, selectOptions, "client"), [projects, selectOptions]);
+
+  return (
+    <div className="flex w-full flex-col gap-3">
+      <div className="flex min-w-0 flex-wrap items-end gap-3">
+        <div className="min-w-[200px] flex-1 sm:min-w-[240px]">
+          <div className="mb-1 text-[10px] uppercase tracking-[0.16em] text-neutral-500">Search</div>
+          <input
+            value={detailSearch}
+            onChange={(e) => setDetailSearch(e.target.value)}
+            placeholder="Search..."
+            className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none"
+          />
+        </div>
+        <MultiSelectDropdown
+          label="ITEM"
+          options={itemChoices}
+          selected={detailFilters.item}
+          onToggle={(v) => toggleDetailFilterValue("item", v)}
+        />
+        <MultiSelectDropdown
+          label="COUNTRY"
+          options={countryChoices}
+          selected={detailFilters.country}
+          onToggle={(v) => toggleDetailFilterValue("country", v)}
+        />
+        <MultiSelectDropdown
+          label="BUSINESS MODEL"
+          options={bmChoices}
+          selected={detailFilters.businessModel}
+          onToggle={(v) => toggleDetailFilterValue("businessModel", v)}
+        />
+        <MultiSelectDropdown
+          label="INCOTERMS"
+          options={incChoices}
+          selected={detailFilters.incoterms}
+          onToggle={(v) => toggleDetailFilterValue("incoterms", v)}
+        />
+        <MultiSelectDropdown
+          label="EXPORTER"
+          options={expChoices}
+          selected={detailFilters.exporter}
+          onToggle={(v) => toggleDetailFilterValue("exporter", v)}
+        />
+        <MultiSelectDropdown
+          label="CLIENT"
+          options={clientChoices}
+          selected={detailFilters.client}
+          onToggle={(v) => toggleDetailFilterValue("client", v)}
+        />
+        <StatusMultiDropdown
+          selected={detailFilters.status}
+          onToggle={(v) => toggleDetailFilterValue("status", v)}
+        />
+        <div className="min-w-[160px] flex-1 sm:max-w-[200px]">
+          <div className="mb-1 text-[10px] uppercase tracking-[0.16em] text-neutral-500">Sort</div>
+          <select
+            value={overviewSortBy}
+            onChange={(e) => setOverviewSortBy(e.target.value as OverviewSortOption)}
+            className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none"
+          >
+            <option value="CODE_ASC">Code A–Z</option>
+            <option value="CODE_DESC">Code Z–A</option>
+            <option value="UPDATED_DESC">Recently updated</option>
+            <option value="PROGRESS_DESC">Progress %</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const SIDEBAR_ACCORDION_ROWS: { id: string; label: string; field: ExplorerStrField }[] = [
+  { id: "item", label: "ITEM", field: "item" },
+  { id: "country", label: "COUNTRY", field: "country" },
+  { id: "businessModel", label: "BUSINESS MODEL", field: "businessModel" },
+  { id: "incoterms", label: "INCOTERMS", field: "incoterms" },
+  { id: "exporter", label: "EXPORTER", field: "exporter" },
+  { id: "client", label: "CLIENT", field: "client" },
+];
+
+function SidebarFilterAccordion({
+  projects,
+  selectOptions,
+  sidebarFilters,
+  toggleSidebarFilterValue,
+}: {
+  projects: Project[];
+  selectOptions: SelectOptions;
+  sidebarFilters: ProjectFilters;
+  toggleSidebarFilterValue: (field: keyof ProjectFilters, value: string | ProjectStatus) => void;
+}) {
+  const [openId, setOpenId] = useState<string | null>(null);
+
+  return (
+    <div className="space-y-1">
+      {SIDEBAR_ACCORDION_ROWS.map((row) => {
+        const choices = mergedChoicesForFilter(projects, selectOptions, row.field);
+        const active = sidebarFilters[row.field] as string[];
+        const header =
+          active.length === 0 ? "ALL" : active.length === 1 ? active[0]! : `${active.length} selected`;
+        const isOpen = openId === row.id;
+        return (
+          <div key={row.id} className="overflow-hidden rounded-xl border border-neutral-200 bg-white">
+            <button
+              type="button"
+              onClick={() => setOpenId((prev) => (prev === row.id ? null : row.id))}
+              className="flex w-full items-center justify-between gap-2 px-3 py-2.5 text-left text-xs font-semibold"
+            >
+              <span>{row.label}</span>
+              <span className="truncate text-[11px] font-normal text-neutral-500">{header}</span>
+            </button>
+            {isOpen ? (
+              <div className="max-h-48 space-y-1 overflow-y-auto border-t border-neutral-100 px-2 py-2">
+                {choices.map((opt) => (
+                  <label
+                    key={opt}
+                    className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-xs hover:bg-neutral-50"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={active.includes(opt)}
+                      onChange={() => toggleSidebarFilterValue(row.field, opt)}
+                    />
+                    <span className="min-w-0 break-all">{opt}</span>
+                  </label>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        );
+      })}
+
+      <div className="overflow-hidden rounded-xl border border-neutral-200 bg-white">
+        <button
+          type="button"
+          onClick={() => setOpenId((prev) => (prev === "status" ? null : "status"))}
+          className="flex w-full items-center justify-between gap-2 px-3 py-2.5 text-left text-xs font-semibold"
+        >
+          <span>STATUS</span>
+          <span className="truncate text-[11px] font-normal text-neutral-500">
+            {filterSummaryLabel(sidebarFilters.status as unknown as string[])}
+          </span>
+        </button>
+        {openId === "status" ? (
+          <div className="max-h-48 space-y-1 overflow-y-auto border-t border-neutral-100 px-2 py-2">
+            {STATUS_FILTER_OPTIONS.map((st) => (
+              <label
+                key={st}
+                className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-xs hover:bg-neutral-50"
+              >
+                <input
+                  type="checkbox"
+                  checked={sidebarFilters.status.includes(st)}
+                  onChange={() => toggleSidebarFilterValue("status", st)}
+                />
+                <span>{st}</span>
+              </label>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function Field({
   label,
   children,
@@ -450,10 +1424,82 @@ function Field({
   children: React.ReactNode;
 }) {
   return (
-    <div className="rounded-2xl border border-neutral-200 bg-white px-4 py-3">
-      <div className="mb-2 text-[11px] uppercase tracking-[0.18em] text-neutral-500">{label}</div>
+    <div className="rounded-xl border border-neutral-200 bg-white px-3 py-2">
+      <div className="mb-1 text-[10px] uppercase tracking-[0.16em] text-neutral-500">{label}</div>
       {children}
     </div>
+  );
+}
+
+function PercentInputField({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+}) {
+  return (
+    <div className="flex h-10 items-center gap-2 rounded-lg border border-neutral-200 bg-white px-3">
+      <input
+        value={value ?? ""}
+        onChange={(e) => onChange(e.target.value.replace(/[^\d.]/g, ""))}
+        placeholder={placeholder}
+        className="min-w-0 flex-1 bg-transparent text-[13px] text-neutral-900 outline-none placeholder:text-neutral-400"
+      />
+      <span className="shrink-0 text-[12px] font-medium text-neutral-500">%</span>
+    </div>
+  );
+}
+
+function PriceField({
+  label,
+  value,
+  currency,
+  unit,
+  onValueChange,
+  onCurrencyChange,
+  onUnitChange,
+  placeholder,
+}: {
+  label: string;
+  value: string;
+  currency: "USD" | "KRW";
+  unit: "KG" | "LB" | "UNIT";
+  onValueChange: (value: string) => void;
+  onCurrencyChange: (value: "USD" | "KRW") => void;
+  onUnitChange: (value: "KG" | "LB" | "UNIT") => void;
+  placeholder?: string;
+}) {
+  return (
+    <Field label={label}>
+      <div className="grid grid-cols-[minmax(0,1fr)_84px_84px] gap-2">
+        <input
+          value={value ?? ""}
+          onChange={(e) => onValueChange(e.target.value)}
+          placeholder={placeholder}
+          className="h-10 w-full rounded-lg border border-neutral-200 bg-white px-3 text-[13px] text-neutral-900 outline-none placeholder:text-neutral-400"
+        />
+        <select
+          value={currency}
+          onChange={(e) => onCurrencyChange(e.target.value as "USD" | "KRW")}
+          className="h-10 w-full rounded-lg border border-neutral-200 bg-white px-2 text-[12px] outline-none"
+        >
+          <option value="USD">USD</option>
+          <option value="KRW">KRW</option>
+        </select>
+        <select
+          value={unit}
+          onChange={(e) => onUnitChange(e.target.value as "KG" | "LB" | "UNIT")}
+          className="h-10 w-full rounded-lg border border-neutral-200 bg-white px-2 text-[12px] outline-none"
+        >
+          <option value="KG">KG</option>
+          <option value="LB">LB</option>
+          <option value="UNIT">UNIT</option>
+        </select>
+      </div>
+    </Field>
   );
 }
 
@@ -463,12 +1509,14 @@ function Input({
   placeholder,
   type = "text",
   readOnly = false,
+  className = "",
 }: {
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
   type?: string;
   readOnly?: boolean;
+  className?: string;
 }) {
   return (
     <input
@@ -479,7 +1527,10 @@ function Input({
       readOnly={readOnly}
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
-      className="w-full bg-transparent text-[14px] text-neutral-900 outline-none placeholder:text-neutral-400 read-only:cursor-default disabled:opacity-100"
+      className={
+        "w-full bg-transparent py-0.5 text-[13px] text-neutral-900 outline-none placeholder:text-neutral-400 read-only:cursor-default disabled:opacity-100 " +
+        className
+      }
     />
   );
 }
@@ -489,11 +1540,13 @@ function TextArea({
   onChange,
   placeholder,
   rows = 3,
+  className = "",
 }: {
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
   rows?: number;
+  className?: string;
 }) {
   return (
     <textarea
@@ -504,7 +1557,10 @@ function TextArea({
       readOnly={false}
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
-      className="w-full resize-none bg-transparent text-[14px] text-neutral-900 outline-none placeholder:text-neutral-400 disabled:opacity-100"
+      className={
+        "w-full resize-none bg-transparent text-[14px] text-neutral-900 outline-none placeholder:text-neutral-400 disabled:opacity-100 " +
+        className
+      }
     />
   );
 }
@@ -522,7 +1578,7 @@ function Select({
     <select
       value={value ?? ""}
       onChange={(e) => onChange(e.target.value)}
-      className="w-full bg-transparent text-[14px] text-neutral-900 outline-none"
+      className="w-full bg-transparent py-0.5 text-[13px] text-neutral-900 outline-none"
     >
       {options.map((option) => (
         <option key={option} value={option}>
@@ -586,23 +1642,114 @@ function extractMentionQuery(value: string) {
   return match ? match[1] : null;
 }
 
+function AssigneeMultiSelect({
+  members,
+  selectedIds,
+  onChange,
+  compact = false,
+}: {
+  members: Member[];
+  selectedIds: string[];
+  onChange: (next: string[]) => void;
+  compact?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handle(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handle);
+    return () => document.removeEventListener("mousedown", handle);
+  }, [open]);
+
+  function toggle(id: string) {
+    if (selectedIds.includes(id)) onChange(selectedIds.filter((x) => x !== id));
+    else onChange([...selectedIds, id]);
+  }
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className={
+          compact
+            ? "flex w-full items-center justify-between gap-1 rounded-lg border border-neutral-200 bg-white px-2 py-1.5 text-left text-[13px] text-neutral-900"
+            : "flex w-full items-center justify-between gap-2 rounded-xl border border-neutral-200 bg-white px-3 py-2 text-left text-[14px] text-neutral-900"
+        }
+      >
+        <span className="min-w-0 truncate">{buildAssigneeSummary(members, selectedIds)}</span>
+        <span className="shrink-0 text-neutral-400">{open ? "▲" : "▼"}</span>
+      </button>
+      {open ? (
+        <div className="absolute left-0 right-0 z-30 mt-1 max-h-52 overflow-y-auto rounded-xl border border-neutral-200 bg-white p-2 shadow-lg">
+          {members.length === 0 ? (
+            <div className="px-2 py-2 text-xs text-neutral-400">등록된 멤버가 없습니다.</div>
+          ) : (
+            members.map((member) => (
+              <label
+                key={member.id}
+                className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-sm hover:bg-neutral-50"
+              >
+                <input type="checkbox" checked={selectedIds.includes(member.id)} onChange={() => toggle(member.id)} />
+                <span className="min-w-0 truncate">{member.name}</span>
+              </label>
+            ))
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function applyDueReminderToStepTree(
+  steps: Step[],
+  sentAtByStep: Map<string, string>,
+  projectId: string,
+  phaseId: string,
+  touchedRef: { v: boolean }
+): Step[] {
+  return steps.map((step) => {
+    const key = `${projectId}\t${phaseId}\t${step.id}`;
+    const sentAt = sentAtByStep.get(key);
+    let next = step;
+    if (sentAt && step.dueReminderSentAt !== sentAt) {
+      touchedRef.v = true;
+      next = { ...step, dueReminderSentAt: sentAt };
+    }
+    if (step.subSteps?.length) {
+      return {
+        ...next,
+        subSteps: applyDueReminderToStepTree(step.subSteps, sentAtByStep, projectId, phaseId, touchedRef),
+      };
+    }
+    return next;
+  });
+}
+
 function applyDueReminderJobResults(prev: Project[], results: DueReminderJobResult[]): Project[] {
   const ok = results.filter((r) => r.ok && r.sentAt);
   if (!ok.length) return prev;
-  const sentAtByStep = new Map(ok.map((r) => [`${r.projectId}\t${r.phaseId}\t${r.stepId}`, r.sentAt]));
+  const sentAtByStep = new Map<string, string>();
+  for (const r of ok) {
+    const key = `${r.projectId}\t${r.phaseId}\t${r.stepId}`;
+    const prevSent = sentAtByStep.get(key);
+    if (!prevSent || (r.sentAt && r.sentAt > prevSent)) {
+      sentAtByStep.set(key, r.sentAt!);
+    }
+  }
   return prev.map((project) => {
-    let projectTouched = false;
+    const touchedRef = { v: false };
     const phases = project.phases.map((phase) => ({
       ...phase,
-      steps: phase.steps.map((step) => {
-        const key = `${project.id}\t${phase.id}\t${step.id}`;
-        const sentAt = sentAtByStep.get(key);
-        if (!sentAt || step.dueReminderSentAt === sentAt) return step;
-        projectTouched = true;
-        return { ...step, dueReminderSentAt: sentAt };
-      }),
+      steps: applyDueReminderToStepTree(phase.steps, sentAtByStep, project.id, phase.id, touchedRef),
     }));
-    return projectTouched
+    return touchedRef.v
       ? { ...project, phases, updated: true, lastChangedAt: nowString() }
       : project;
   });
@@ -643,28 +1790,25 @@ export default function Page() {
   const [authUserEmail, setAuthUserEmail] = useState<string | null>(null);
   const [memberPanelOpen, setMemberPanelOpen] = useState(false);
 
-  const [panelOpen, setPanelOpen] = useState(false);
-  const [filterOpen, setFilterOpen] = useState(false);
+  const [sidebarSearch, setSidebarSearch] = useState("");
+  const [sidebarFilters, setSidebarFilters] = useState<ProjectFilters>(() => defaultProjectFilters());
+  const [detailSearch, setDetailSearch] = useState("");
+  const [detailFilters, setDetailFilters] = useState<ProjectFilters>(() => defaultProjectFilters());
+  const [selectOptions, setSelectOptions] = useState<SelectOptions>(() => emptySelectOptions());
+  const [searchPanelOpen, setSearchPanelOpen] = useState(false);
+  const [filterPanelOpen, setFilterPanelOpen] = useState(false);
+  const [allProjectsExpanded, setAllProjectsExpanded] = useState(false);
+  const [overviewSortBy, setOverviewSortBy] = useState<OverviewSortOption>("CODE_ASC");
+  const [optionManageField, setOptionManageField] = useState<SelectOptionFieldKey | null>(null);
+  const [emailLogOpen, setEmailLogOpen] = useState(false);
 
-  const [formMode, setFormMode] = useState<FormMode>("create");
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [form, setForm] = useState<ProjectForm>(emptyForm());
-
-  const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState("ALL");
-  const [countryFilter, setCountryFilter] = useState("ALL");
-  const [itemFilter, setItemFilter] = useState("ALL");
-  const [clientFilter, setClientFilter] = useState("ALL");
-  const [exporterFilter, setExporterFilter] = useState("ALL");
-  const [overdueFilter, setOverdueFilter] = useState("ALL");
-  const [sortBy, setSortBy] = useState<SortOption>("UPDATED_DESC");
-
-  const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({});
-  const [commentOpenMap, setCommentOpenMap] = useState<Record<string, boolean>>({});
-  const [savingCommentStepId, setSavingCommentStepId] = useState<string | null>(null);
+  const [stepDrafts, setStepDrafts] = useState<Record<string, StepEditorDraft>>({});
+  const [savingStepId, setSavingStepId] = useState<string | null>(null);
   const [dueReminderBusy, setDueReminderBusy] = useState(false);
   /** 첫 로드(Supabase 또는 레거시 localStorage) 완료 전에는 저장하지 않음 */
   const [storageReady, setStorageReady] = useState(false);
+  /** URL ?step= 딥링크로 포커스된 행 강조 */
+  const [highlightedStepId, setHighlightedStepId] = useState<string | null>(null);
 
   const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const realtimeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -796,6 +1940,35 @@ export default function Page() {
               setSelectedId(sid);
             }
           }
+          const legacyPf =
+            parsed.projectFilters && typeof parsed.projectFilters === "object" && !Array.isArray(parsed.projectFilters)
+              ? (parsed.projectFilters as ProjectFilters)
+              : null;
+          if (parsed.sidebarFilters && typeof parsed.sidebarFilters === "object" && !Array.isArray(parsed.sidebarFilters)) {
+            if (!cancelled) {
+              setSidebarFilters({ ...defaultProjectFilters(), ...(parsed.sidebarFilters as ProjectFilters) });
+            }
+          } else if (legacyPf && !cancelled) {
+            setSidebarFilters({ ...defaultProjectFilters(), ...legacyPf });
+          }
+          if (parsed.detailFilters && typeof parsed.detailFilters === "object" && !Array.isArray(parsed.detailFilters)) {
+            if (!cancelled) {
+              setDetailFilters({ ...defaultProjectFilters(), ...(parsed.detailFilters as ProjectFilters) });
+            }
+          } else if (legacyPf && !cancelled) {
+            setDetailFilters({ ...defaultProjectFilters(), ...legacyPf });
+          }
+          if (typeof parsed.sidebarSearch === "string" && !cancelled) {
+            setSidebarSearch(parsed.sidebarSearch);
+          }
+          if (typeof parsed.detailSearch === "string" && !cancelled) {
+            setDetailSearch(parsed.detailSearch);
+          }
+          if (parsed.selectOptions && typeof parsed.selectOptions === "object" && !Array.isArray(parsed.selectOptions)) {
+            if (!cancelled) {
+              setSelectOptions({ ...emptySelectOptions(), ...(parsed.selectOptions as SelectOptions) });
+            }
+          }
         }
       }
     } catch {
@@ -894,12 +2067,94 @@ export default function Page() {
         projects,
         selectedId,
         globalMembers: isSupabaseDashboardEnabled() ? [] : globalMembers,
+        sidebarFilters,
+        detailFilters,
+        sidebarSearch,
+        detailSearch,
+        selectOptions,
       };
       localStorage.setItem(FLOWCHART_LEGACY_STORAGE_KEY, JSON.stringify(payload));
     } catch {
       // 할당량 초과 등
     }
-  }, [projects, selectedId, globalMembers, storageReady]);
+  }, [projects, selectedId, globalMembers, storageReady, sidebarFilters, detailFilters, sidebarSearch, detailSearch, selectOptions]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !storageReady) return;
+
+    const sp = new URLSearchParams(window.location.search);
+    const urlProject = sp.get("project")?.trim() ?? "";
+    const urlStep = sp.get("step")?.trim() ?? "";
+    if (!urlProject && !urlStep) return;
+
+    let cancelled = false;
+    /** 브라우저 setTimeout 핸들(@types/node와 DOM 타입 충돌 방지) */
+    let clearHighlightTimer: number | null = null;
+
+    if (urlProject) {
+      const exists = projects.some((p) => p.id === urlProject);
+      if (!exists) return;
+      if (selectedId !== urlProject) {
+        setSelectedId(urlProject);
+        return;
+      }
+    }
+
+    if (!urlStep) {
+      if (urlProject) {
+        try {
+          const u = new URL(window.location.href);
+          u.searchParams.delete("project");
+          u.searchParams.delete("step");
+          const qs = u.searchParams.toString();
+          window.history.replaceState({}, "", qs ? `${u.pathname}?${qs}` : u.pathname);
+        } catch {
+          /* ignore */
+        }
+      }
+      return;
+    }
+
+    const pid = urlProject || selectedId;
+    if (!pid) return;
+    if (urlProject && selectedId !== urlProject) return;
+
+    const proj = projects.find((p) => p.id === pid);
+    if (!proj) return;
+    const hasStep = proj.phases.some((ph) => stepIdExistsInSteps(ph.steps, urlStep));
+    if (!hasStep) return;
+
+    let raf1 = 0;
+    let raf2 = 0;
+    raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        if (cancelled) return;
+        const el = document.getElementById(`step-${urlStep}`);
+        if (!el) return;
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        setHighlightedStepId(urlStep);
+        try {
+          const u = new URL(window.location.href);
+          u.searchParams.delete("project");
+          u.searchParams.delete("step");
+          const qs = u.searchParams.toString();
+          window.history.replaceState({}, "", qs ? `${u.pathname}?${qs}` : u.pathname);
+        } catch {
+          /* ignore */
+        }
+        clearHighlightTimer = window.setTimeout(() => {
+          setHighlightedStepId(null);
+        }, 4000);
+      });
+    });
+
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+      if (clearHighlightTimer !== null) window.clearTimeout(clearHighlightTimer);
+    };
+  }, [storageReady, projects, selectedId]);
 
   useEffect(() => {
     if (!isSupabaseDashboardEnabled() || !storageReady) return;
@@ -1075,169 +2330,386 @@ export default function Page() {
     [projects, selectedId]
   );
 
-  const countryOptions = useMemo(
-    () => ["ALL", ...Array.from(new Set(projects.map((p) => p.country))).filter(Boolean)],
-    [projects]
-  );
+  useEffect(() => {
+    if (!selectedProject) return;
 
-  const itemOptions = useMemo(
-    () => ["ALL", ...Array.from(new Set(projects.map((p) => p.item))).filter(Boolean)],
-    [projects]
-  );
+    setStepDrafts((prev) => {
+      const next = { ...prev };
+      let changed = false;
 
-  const clientOptions = useMemo(
-    () => ["ALL", ...Array.from(new Set(projects.map((p) => p.client))).filter(Boolean)],
-    [projects]
-  );
+      for (const phase of selectedProject.phases) {
+        forEachStepInTree(phase.steps, (step) => {
+          const current = next[step.id];
+          if (!current) {
+            next[step.id] = stepToDraft(step);
+            changed = true;
+            return;
+          }
 
-  const exporterOptions = useMemo(
-    () => ["ALL", ...Array.from(new Set(projects.map((p) => p.exporter))).filter(Boolean)],
-    [projects]
-  );
+          const shouldSyncConfirmedAt = current.confirmedAt !== step.confirmedAt;
+          const shouldSyncDueDate = current.dueDate !== step.dueDate && current.dueDate === "";
+          const shouldSyncAssignee =
+            !idSetsEqual(current.assigneeMemberIds, step.assigneeMemberIds) &&
+            current.assigneeMemberIds.length === 0;
+          const shouldSyncMemo = current.memo !== step.memo && current.memo === "";
 
-  const filteredProjects = useMemo(() => {
-    const result = [...projects].filter((project) => {
-      const q = search.trim().toLowerCase();
-
-      const searchOk =
-        !q ||
-        [project.code, project.country, project.exporter, project.item, project.client, project.note]
-          .join(" ")
-          .toLowerCase()
-          .includes(q);
-
-      const statusOk = statusFilter === "ALL" || project.status === statusFilter;
-      const countryOk = countryFilter === "ALL" || project.country === countryFilter;
-      const itemOk = itemFilter === "ALL" || project.item === itemFilter;
-      const clientOk = clientFilter === "ALL" || project.client === clientFilter;
-      const exporterOk = exporterFilter === "ALL" || project.exporter === exporterFilter;
-
-      const overdueCount = getOverdueCount(project);
-      const overdueOk =
-        overdueFilter === "ALL" ||
-        (overdueFilter === "YES" && overdueCount > 0) ||
-        (overdueFilter === "NO" && overdueCount === 0);
-
-      return searchOk && statusOk && countryOk && itemOk && clientOk && exporterOk && overdueOk;
-    });
-
-    result.sort((a, b) => {
-      if (sortBy === "CODE_ASC") return a.code.localeCompare(b.code);
-      if (sortBy === "CODE_DESC") return b.code.localeCompare(a.code);
-      if (sortBy === "PROGRESS_DESC") return getProjectProgress(b).percent - getProjectProgress(a).percent;
-      return b.lastChangedAt.localeCompare(a.lastChangedAt);
-    });
-
-    return result;
-  }, [
-    projects,
-    search,
-    statusFilter,
-    countryFilter,
-    itemFilter,
-    clientFilter,
-    exporterFilter,
-    overdueFilter,
-    sortBy,
-  ]);
-
-  function updateFormField<K extends keyof ProjectForm>(key: K, value: ProjectForm[K]) {
-    setForm((prev) => ({ ...prev, [key]: value }));
-  }
-
-  function openCreatePanel() {
-    setFormMode("create");
-    setEditingId(null);
-    setForm({
-      code: "DRAFT",
-      status: "DRAFT",
-      country: "",
-      exporter: "",
-      item: "GREEN BEAN",
-      client: "",
-      note: "",
-    });
-    setPanelOpen(true);
-  }
-
-  function openEditPanel(project: Project) {
-    setFormMode("edit");
-    setEditingId(project.id);
-    setForm({
-      code: project.code || "",
-      status: project.status,
-      country: project.country || "",
-      exporter: project.exporter || "",
-      item: project.item || "GREEN BEAN",
-      client: project.client || "",
-      note: project.note || "",
-    });
-    setPanelOpen(true);
-  }
-
-  function saveProject() {
-    const code = form.code.trim() || "DRAFT";
-
-    if (formMode === "create") {
-      const duplicate = projects.some((project) => project.code.toLowerCase() === code.toLowerCase());
-      if (duplicate) {
-        alert("중복 CODE입니다. 다른 CODE를 입력해주세요.");
-        return;
+          if (shouldSyncConfirmedAt || shouldSyncDueDate || shouldSyncAssignee || shouldSyncMemo) {
+            next[step.id] = {
+              dueDate: shouldSyncDueDate ? step.dueDate : current.dueDate,
+              confirmedAt: step.confirmedAt,
+              memo: shouldSyncMemo ? step.memo : current.memo,
+              assigneeMemberIds: shouldSyncAssignee ? [...step.assigneeMemberIds] : current.assigneeMemberIds,
+            };
+            changed = true;
+          }
+        });
       }
 
-      const newProject = makeProject({
-        code,
-        status: form.status,
-        country: form.country.trim().toUpperCase(),
-        exporter: form.exporter.trim(),
-        item: form.item.trim().toUpperCase(),
-        client: form.client.trim(),
-        note: form.note.trim(),
-        updated: true,
-        lastChangedAt: nowString(),
-        phases: createFixedFlowchartPhases(),
-        notificationLogs: [],
-      });
+      return changed ? next : prev;
+    });
+  }, [selectedProject]);
 
-      setProjects((prev) => [newProject, ...prev]);
-      setSelectedId(newProject.id);
-      setPanelOpen(false);
-      setForm(emptyForm());
+  useEffect(() => {
+    const proj = projects.find((p) => p.id === selectedId) ?? null;
+    if (!proj) {
+      setStepDrafts({});
       return;
     }
+    const m: Record<string, StepEditorDraft> = {};
+    for (const ph of proj.phases) {
+      forEachStepInTree(ph.steps, (s) => {
+        m[s.id] = stepToDraft(s);
+      });
+    }
+    setStepDrafts(m);
+    // 프로젝트 데이터가 바뀔 때마다 초기화하면 편집 중인 draft가 날아가므로 selectedId 전환 시에만 동기화
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 위 의도
+  }, [selectedId]);
 
-    if (formMode === "edit" && editingId) {
+  useEffect(() => {
+    setSelectOptions((prev) => mergeSelectOptionsWithProjects(prev, projects));
+  }, [projects]);
+
+  function toggleSidebarFilterValue(field: keyof ProjectFilters, value: string | ProjectStatus) {
+    setSidebarFilters((prev) => {
+      if (field === "status") {
+        const st = value as ProjectStatus;
+        const cur = [...prev.status];
+        const i = cur.indexOf(st);
+        if (i >= 0) cur.splice(i, 1);
+        else cur.push(st);
+        return { ...prev, status: cur };
+      }
+      const fk = field as Exclude<keyof ProjectFilters, "status">;
+      const cur = [...(prev[fk] as string[])];
+      const v = String(value);
+      const i = cur.indexOf(v);
+      if (i >= 0) cur.splice(i, 1);
+      else cur.push(v);
+      return { ...prev, [fk]: cur };
+    });
+  }
+
+  function toggleDetailFilterValue(field: keyof ProjectFilters, value: string | ProjectStatus) {
+    setDetailFilters((prev) => {
+      if (field === "status") {
+        const st = value as ProjectStatus;
+        const cur = [...prev.status];
+        const i = cur.indexOf(st);
+        if (i >= 0) cur.splice(i, 1);
+        else cur.push(st);
+        return { ...prev, status: cur };
+      }
+      const fk = field as Exclude<keyof ProjectFilters, "status">;
+      const cur = [...(prev[fk] as string[])];
+      const v = String(value);
+      const i = cur.indexOf(v);
+      if (i >= 0) cur.splice(i, 1);
+      else cur.push(v);
+      return { ...prev, [fk]: cur };
+    });
+  }
+
+  const sidebarFilteredProjects = useMemo(() => {
+    const q = sidebarSearch.trim().toLowerCase();
+    let list = applyProjectFilters(projects, sidebarFilters);
+    if (q) {
+      list = list.filter((project) => {
+        const blob = [
+          project.code,
+          project.country,
+          project.certificate,
+          project.businessModel,
+          project.incoterms,
+          project.exporter,
+          project.item,
+          project.client,
+          project.note,
+        ]
+          .map((x) => (x == null ? "" : String(x)))
+          .join(" ")
+          .toLowerCase();
+        return blob.includes(q);
+      });
+    }
+    return [...list].sort((a, b) => a.code.localeCompare(b.code, undefined, { sensitivity: "base" }));
+  }, [projects, sidebarFilters, sidebarSearch]);
+
+  const overviewFilteredProjects = useMemo(() => {
+    let list = applyProjectFilters(projects, detailFilters);
+    const q = detailSearch.trim().toLowerCase();
+    if (q) {
+      list = list.filter((project) => {
+        const blob = [
+          project.code,
+          project.country,
+          project.certificate,
+          project.businessModel,
+          project.incoterms,
+          project.exporter,
+          project.item,
+          project.client,
+          project.note,
+        ]
+          .map((x) => (x == null ? "" : String(x)))
+          .join(" ")
+          .toLowerCase();
+        return blob.includes(q);
+      });
+    }
+    const sorted = [...list];
+    if (overviewSortBy === "CODE_ASC") {
+      sorted.sort((a, b) => a.code.localeCompare(b.code, undefined, { sensitivity: "base" }));
+    } else if (overviewSortBy === "CODE_DESC") {
+      sorted.sort((a, b) => b.code.localeCompare(a.code, undefined, { sensitivity: "base" }));
+    } else if (overviewSortBy === "PROGRESS_DESC") {
+      sorted.sort((a, b) => getProjectProgress(b).percent - getProjectProgress(a).percent);
+    } else {
+      sorted.sort((a, b) => b.lastChangedAt.localeCompare(a.lastChangedAt));
+    }
+    return sorted;
+  }, [projects, detailFilters, detailSearch, overviewSortBy]);
+
+  const boardGroups = useMemo(() => {
+    const map = new Map<string, Project[]>();
+    for (const project of overviewFilteredProjects) {
+      const key =
+        typeof project.item === "string" && project.item.trim() ? project.item.trim() : "NO ITEM";
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(project);
+    }
+    return Array.from(map.entries()).filter(([, list]) => list.length > 0);
+  }, [overviewFilteredProjects]);
+
+  function updateProjectField(
+    projectId: string,
+    field: keyof ProjectHeaderDraft,
+    value: string | ProjectStatus
+  ) {
+    if (projectId !== selectedId) return;
+
+    const normalizeUpper = (s: string) => {
+      const t = s.trim();
+      return t.length ? t.toUpperCase() : "";
+    };
+
+    if (field === "code") {
+      const nextCode = String(value).trim();
       const duplicate = projects.some(
-        (project) => project.id !== editingId && project.code.toLowerCase() === code.toLowerCase()
+        (project) =>
+          project.id !== projectId &&
+          project.code.trim().toLowerCase() === nextCode.toLowerCase()
       );
-      if (duplicate) {
+      if (nextCode && duplicate) {
         alert("다른 프로젝트가 이미 같은 CODE를 사용 중입니다.");
         return;
       }
-
-      setProjects((prev) =>
-        prev.map((project) =>
-          project.id === editingId
-            ? {
-                ...project,
-                code,
-                status: form.status,
-                country: form.country.trim().toUpperCase(),
-                exporter: form.exporter.trim(),
-                item: form.item.trim().toUpperCase(),
-                client: form.client.trim(),
-                note: form.note.trim(),
-                updated: true,
-                lastChangedAt: nowString(),
-              }
-            : project
-        )
-      );
-
-      setPanelOpen(false);
-      setEditingId(null);
-      setForm(emptyForm());
     }
+
+    const ts = nowString();
+    const autoConfirmedAt = todayLocalDate();
+
+    setProjects((prev) =>
+      prev.map((project) => {
+        if (project.id !== projectId) return project;
+
+        let nextProject: Project = {
+          ...project,
+          code:
+            field === "code"
+              ? String(value).trim() || "DRAFT"
+              : project.code,
+          status:
+            field === "status"
+              ? (value as ProjectStatus)
+              : project.status,
+          country:
+            field === "country"
+              ? normalizeUpper(String(value))
+              : project.country,
+          certificate:
+            field === "certificate"
+              ? String(value).trim()
+              : project.certificate,
+          businessModel:
+            field === "businessModel"
+              ? String(value).trim()
+              : project.businessModel,
+          incoterms:
+            field === "incoterms"
+              ? String(value).trim()
+              : project.incoterms,
+          exporter:
+            field === "exporter"
+              ? String(value).trim()
+              : project.exporter,
+          client:
+            field === "client"
+              ? String(value).trim()
+              : project.client,
+          item:
+            field === "item"
+              ? normalizeUpper(String(value))
+              : project.item,
+          hsCode:
+            field === "hsCode"
+              ? String(value).trim()
+              : project.hsCode,
+          customRate:
+            field === "customRate"
+              ? String(value).trim()
+              : project.customRate,
+          vatRate:
+            field === "vatRate"
+              ? String(value).trim()
+              : project.vatRate,
+          etd:
+            field === "etd"
+              ? String(value).trim()
+              : project.etd,
+          eta:
+            field === "eta"
+              ? String(value).trim()
+              : project.eta,
+          priceValue:
+            field === "priceValue"
+              ? String(value).trim()
+              : project.priceValue,
+          priceCurrency:
+            field === "priceCurrency"
+              ? (value as "USD" | "KRW")
+              : project.priceCurrency,
+          priceUnit:
+            field === "priceUnit"
+              ? (value as "KG" | "LB" | "UNIT")
+              : project.priceUnit,
+          offerPriceValue:
+            field === "offerPriceValue"
+              ? String(value).trim()
+              : project.offerPriceValue,
+          offerPriceCurrency:
+            field === "offerPriceCurrency"
+              ? (value as "USD" | "KRW")
+              : project.offerPriceCurrency,
+          offerPriceUnit:
+            field === "offerPriceUnit"
+              ? (value as "KG" | "LB" | "UNIT")
+              : project.offerPriceUnit,
+          finalPriceValue:
+            field === "finalPriceValue"
+              ? String(value).trim()
+              : project.finalPriceValue,
+          finalPriceCurrency:
+            field === "finalPriceCurrency"
+              ? (value as "USD" | "KRW")
+              : project.finalPriceCurrency,
+          finalPriceUnit:
+            field === "finalPriceUnit"
+              ? (value as "KG" | "LB" | "UNIT")
+              : project.finalPriceUnit,
+          updated: true,
+          lastChangedAt: ts,
+        };
+
+        if (field === "certificate" && nextProject.certificate !== "") {
+          nextProject = autoCheckProjectStepByLabel(
+            nextProject,
+            "2-2 인증정보 확인",
+            autoConfirmedAt,
+            ts
+          );
+        }
+
+        if (field === "priceValue" && nextProject.priceValue !== "") {
+          nextProject = autoCheckProjectStepByLabel(
+            nextProject,
+            "3-2 ORDER PRICE 체크",
+            autoConfirmedAt,
+            ts
+          );
+        }
+
+        if (field === "offerPriceValue" && nextProject.offerPriceValue !== "") {
+          nextProject = autoCheckProjectStepByLabel(
+            nextProject,
+            "3-3 CLIENT 오퍼가격 확인",
+            autoConfirmedAt,
+            ts
+          );
+        }
+
+        if (field === "finalPriceValue" && nextProject.finalPriceValue !== "") {
+          nextProject = autoCheckProjectStepByLabel(
+            nextProject,
+            "Settlement",
+            autoConfirmedAt,
+            ts
+          );
+        }
+
+        return nextProject;
+      })
+    );
+  }
+
+  function handleCreatableCreate(
+    optionField: SelectOptionFieldKey,
+    draftField: keyof ProjectHeaderDraft,
+    raw: string
+  ) {
+    if (!selectedProject) return;
+    setSelectOptions((prev) => {
+      const r = addOptionToList(prev[optionField], raw);
+      if (!r) return prev;
+      updateProjectField(selectedProject.id, draftField, r.canonical);
+      return { ...prev, [optionField]: r.next };
+    });
+  }
+
+  function removeOption(field: SelectOptionFieldKey, value: string) {
+    if (countOptionUsage(field, value, projects) > 0) return;
+    setSelectOptions((prev) => ({ ...prev, [field]: removeOptionFromList(prev[field], value) }));
+  }
+
+  function handleAddOption(field: SelectOptionFieldKey, rawValue: string) {
+    setSelectOptions((prev) => {
+      const r = addOptionToList(prev[field], rawValue);
+      return r ? { ...prev, [field]: r.next } : prev;
+    });
+  }
+
+  function createNewProjectFlow() {
+    const p = makeProject({
+      code: "DRAFT",
+      status: "DRAFT",
+      note: "",
+      updated: true,
+      lastChangedAt: nowString(),
+      notificationLogs: [],
+    });
+    setProjects((prev) => [p, ...prev]);
+    setSelectedId(p.id);
+    setAllProjectsExpanded(false);
   }
 
   function deleteSelectedProject() {
@@ -1248,7 +2720,7 @@ export default function Page() {
     const next = projects.filter((project) => project.id !== selectedProject.id);
     setProjects(next);
     setSelectedId(next[0]?.id ?? "");
-    setPanelOpen(false);
+    setAllProjectsExpanded(false);
   }
 
   function updateStep(projectId: string, phaseId: string, stepId: string, patch: Partial<Step>) {
@@ -1264,46 +2736,20 @@ export default function Page() {
               ? phase
               : {
                   ...phase,
-                  steps: phase.steps.map((step) => {
-                    if (step.id !== stepId) return step;
-                    const next: Step = { ...step, ...patch };
-                    if (patch.dueDate !== undefined && patch.dueDate !== step.dueDate) {
-                      next.dueReminderSentAt = "";
-                    }
-                    if (patch.assigneeMemberId !== undefined && patch.assigneeMemberId !== step.assigneeMemberId) {
-                      next.dueReminderSentAt = "";
-                    }
-                    return next;
-                  }),
-                }
-          ),
-        };
-      })
-    );
-  }
-
-  function toggleStepChecked(projectId: string, phaseId: string, stepId: string, checked: boolean) {
-    setProjects((prev) =>
-      prev.map((project) => {
-        if (project.id !== projectId) return project;
-        return {
-          ...project,
-          updated: true,
-          lastChangedAt: nowString(),
-          phases: project.phases.map((phase) =>
-            phase.id !== phaseId
-              ? phase
-              : {
-                  ...phase,
-                  steps: phase.steps.map((step) =>
-                    step.id === stepId
-                      ? {
-                          ...step,
-                          checked,
-                          confirmedAt: checked ? isoNowLocal() : "",
-                          dueReminderSentAt: checked ? "" : step.dueReminderSentAt,
-                        }
-                      : step
+                  steps: reconcilePhaseSteps(
+                    patchStepInTree(phase.steps, stepId, (step) => {
+                      const next: Step = { ...step, ...patch };
+                      if (patch.dueDate !== undefined && patch.dueDate !== step.dueDate) {
+                        next.dueReminderSentAt = "";
+                      }
+                      if (
+                        patch.assigneeMemberIds !== undefined &&
+                        !idSetsEqual(patch.assigneeMemberIds, step.assigneeMemberIds)
+                      ) {
+                        next.dueReminderSentAt = "";
+                      }
+                      return next;
+                    })
                   ),
                 }
           ),
@@ -1312,14 +2758,146 @@ export default function Page() {
     );
   }
 
-  function togglePhase(projectId: string, phaseId: string) {
+  function toggleStepNotApplicable(
+    projectId: string,
+    phaseId: string,
+    stepId: string,
+    checked: boolean
+  ) {
+    const phase = projects.find((p) => p.id === projectId)?.phases.find((ph) => ph.id === phaseId);
+    const st = phase ? findStepInPhaseSteps(phase.steps, stepId) : undefined;
+    if (!st) return;
+
+    if (checked) {
+      const confirmed = st.confirmedAt?.trim() ? st.confirmedAt : todayLocalDate();
+      setProjects((prev) =>
+        prev.map((project) => {
+          if (project.id !== projectId) return project;
+          return {
+            ...project,
+            updated: true,
+            lastChangedAt: nowString(),
+            phases: project.phases.map((ph) =>
+              ph.id !== phaseId
+                ? ph
+                : {
+                    ...ph,
+                    steps: reconcilePhaseSteps(
+                      patchStepInTree(ph.steps, stepId, (step) => ({
+                        ...step,
+                        notApplicable: true,
+                        checked: true,
+                        confirmedAt: confirmed,
+                        dueReminderSentAt: "",
+                      }))
+                    ),
+                  }
+            ),
+          };
+        })
+      );
+      setStepDrafts((prev) => ({
+        ...prev,
+        [stepId]: { ...(prev[stepId] ?? stepToDraft(st)), confirmedAt: confirmed },
+      }));
+      return;
+    }
+
     setProjects((prev) =>
       prev.map((project) => {
         if (project.id !== projectId) return project;
         return {
           ...project,
-          phases: project.phases.map((phase) =>
-            phase.id === phaseId ? { ...phase, expanded: !phase.expanded } : phase
+          updated: true,
+          lastChangedAt: nowString(),
+          phases: project.phases.map((ph) =>
+            ph.id !== phaseId
+              ? ph
+              : {
+                  ...ph,
+                  steps: reconcilePhaseSteps(
+                    patchStepInTree(ph.steps, stepId, (step) => ({
+                      ...step,
+                      notApplicable: false,
+                      checked: false,
+                    }))
+                  ),
+                }
+          ),
+        };
+      })
+    );
+    setStepDrafts((prev) => ({
+      ...prev,
+      [stepId]: { ...(prev[stepId] ?? stepToDraft(st)), confirmedAt: st.confirmedAt },
+    }));
+  }
+
+  function toggleStepChecked(projectId: string, phaseId: string, stepId: string, checked: boolean) {
+    const phase = projects.find((p) => p.id === projectId)?.phases.find((ph) => ph.id === phaseId);
+    const st = phase ? findStepInPhaseSteps(phase.steps, stepId) : undefined;
+    if (st?.notApplicable) return;
+    const newConfirmed =
+      !st ? "" : checked ? (st.confirmedAt?.trim() ? st.confirmedAt : todayLocalDate()) : st.confirmedAt;
+
+    setProjects((prev) =>
+      prev.map((project) => {
+        if (project.id !== projectId) return project;
+        return {
+          ...project,
+          updated: true,
+          lastChangedAt: nowString(),
+          phases: project.phases.map((ph) =>
+            ph.id !== phaseId
+              ? ph
+              : {
+                  ...ph,
+                  steps: reconcilePhaseSteps(
+                    patchStepInTree(ph.steps, stepId, (step) => ({
+                      ...step,
+                      checked,
+                      confirmedAt: newConfirmed,
+                      dueReminderSentAt: checked ? "" : step.dueReminderSentAt,
+                    }))
+                  ),
+                }
+          ),
+        };
+      })
+    );
+
+    if (st) {
+      setStepDrafts((prev) => ({
+        ...prev,
+        [stepId]: {
+          ...(prev[stepId] ?? stepToDraft(st)),
+          confirmedAt: newConfirmed,
+        },
+      }));
+    }
+  }
+
+  function toggleStepExpanded(projectId: string, phaseId: string, stepId: string) {
+    const phase = projects.find((p) => p.id === projectId)?.phases.find((ph) => ph.id === phaseId);
+    const st = phase ? findStepInPhaseSteps(phase.steps, stepId) : undefined;
+    if (!st?.subSteps?.length) return;
+    setProjects((prev) =>
+      prev.map((project) => {
+        if (project.id !== projectId) return project;
+        return {
+          ...project,
+          updated: true,
+          lastChangedAt: nowString(),
+          phases: project.phases.map((ph) =>
+            ph.id !== phaseId
+              ? ph
+              : {
+                  ...ph,
+                  steps: patchStepInTree(ph.steps, stepId, (step) => ({
+                    ...step,
+                    expanded: !step.expanded,
+                  })),
+                }
           ),
         };
       })
@@ -1356,75 +2934,95 @@ export default function Page() {
         ...project,
         phases: project.phases.map((phase) => ({
           ...phase,
-          steps: phase.steps.map((step) =>
-            step.assigneeMemberId === memberId ? { ...step, assigneeMemberId: "" } : step
-          ),
+          steps: phase.steps.map((step) => removeMemberFromStepTree(step, memberId)),
         })),
       }))
     );
   }
 
-  function toggleCommentOpen(stepId: string) {
-    setCommentOpenMap((prev) => ({
+  function patchStepDraft(stepId: string, patch: Partial<StepEditorDraft>, baseStep: Step) {
+    setStepDrafts((prev) => ({
       ...prev,
-      [stepId]: !prev[stepId],
+      [stepId]: { ...(prev[stepId] ?? stepToDraft(baseStep)), ...patch },
     }));
   }
 
-  function setCommentDraft(stepId: string, value: string) {
-    setCommentDrafts((prev) => ({
+  function resetStepDraftFields(stepId: string) {
+    setStepDrafts((prev) => ({
       ...prev,
-      [stepId]: value,
+      [stepId]: {
+        dueDate: "",
+        confirmedAt: "",
+        memo: "",
+        assigneeMemberIds: [],
+      },
     }));
   }
 
-  function applyMention(stepId: string, member: Member) {
-    const current = commentDrafts[stepId] ?? "";
-    const query = extractMentionQuery(current);
-    if (query === null) return;
-
-    const replaced = current.replace(/@([^\s@]*)$/, `@${member.name} `);
-    setCommentDraft(stepId, replaced);
+  function applyMentionToDraft(stepId: string, member: Member, baseStep: Step) {
+    setStepDrafts((prev) => {
+      const cur = prev[stepId] ?? stepToDraft(baseStep);
+      const query = extractMentionQuery(cur.memo);
+      if (query === null) return prev;
+      const replaced = cur.memo.replace(/@([^\s@]*)$/, `@${member.name} `);
+      return { ...prev, [stepId]: { ...cur, memo: replaced } };
+    });
   }
 
-  async function addCommentWithMentions(projectId: string, phaseId: string, stepId: string) {
-    const draft = (commentDrafts[stepId] ?? "").trim();
-    if (!draft || !selectedProject) return;
-    if (savingCommentStepId) return;
+  async function saveStepDraft(projectId: string, phaseId: string, stepId: string) {
+    if (!selectedProject || savingStepId) return;
+    const phase = selectedProject.phases.find((ph) => ph.id === phaseId);
+    const step = phase ? findStepInPhaseSteps(phase.steps, stepId) : undefined;
+    if (!phase || !step) return;
 
-    const mentionedMembers = globalMembers.filter((member) => draft.includes(`@${member.name}`));
+    const draft = stepDrafts[stepId] ?? stepToDraft(step);
+    const text = draft.memo.trim();
+    const mentions = extractMentionsFromText(draft.memo, globalMembers);
+    const recipientsForNotify = buildNotificationRecipients(
+      draft.memo,
+      draft.assigneeMemberIds,
+      globalMembers
+    );
+    const notifyText =
+      draft.memo.trim() || `${step.label} 단계가 업데이트되었습니다.`;
 
-    const mentions: Mention[] = mentionedMembers.map((member) => ({
-      memberId: member.id,
-      name: member.name,
-      email: member.email,
-    }));
+    console.log("[notify] mentions", mentions);
+    console.log("[notify] assigneeMemberIds", draft.assigneeMemberIds);
+    console.log("[notify] recipientsForNotify", recipientsForNotify);
 
-    const currentPhase = selectedProject.phases.find((phase) => phase.id === phaseId);
-    const currentStep = currentPhase?.steps.find((step) => step.id === stepId);
-    const commentCreatedAt = nowString();
-
-    setSavingCommentStepId(stepId);
-    let emailNotify: NotificationLog["emailNotify"];
+    setSavingStepId(stepId);
+    let emailNotify: NotificationLog["emailNotify"] | undefined;
+    let notifyFetchThrew = false;
+    const logCreatedAt = nowString();
+    const stepLink = buildFlowchartStepDeepLink(selectedProject.id, step.id);
 
     try {
-      if (mentions.length) {
+      if (recipientsForNotify.length > 0) {
+        const requestBody = {
+          recipients: recipientsForNotify.map((m) => ({ email: m.email, name: m.name })),
+          projectCode: selectedProject.code,
+          stepLabel: step.label,
+          phaseTitle: phase.title,
+          authorName: "나",
+          commentText: notifyText,
+          createdAt: logCreatedAt,
+          stepLink,
+          projectId: selectedProject.id,
+          stepId: step.id,
+        };
+        console.log("[notify] requestBody", requestBody);
+
         try {
           const res = await fetch("/api/notify-mention", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              recipients: mentions.map((m) => ({ email: m.email, name: m.name })),
-              projectCode: selectedProject.code,
-              stepLabel: currentStep?.label ?? "",
-              phaseTitle: currentPhase?.title ?? "",
-              authorName: "나",
-              commentText: draft,
-              createdAt: commentCreatedAt,
-            }),
+            body: JSON.stringify(requestBody),
           });
 
           const data = (await res.json()) as MentionNotifyResponse & { error?: string };
+          console.log("[notify] response.ok", res.ok);
+          console.log("[notify] responseData", data);
+
           if (!res.ok) {
             throw new Error(data.error || `요청 실패 (${res.status})`);
           }
@@ -1443,13 +3041,15 @@ export default function Page() {
             perRecipient,
           };
         } catch (e) {
+          notifyFetchThrew = true;
           const msg = e instanceof Error ? e.message : "알 수 없는 오류";
+          alert(`알림 메일 발송 실패: ${msg}`);
           emailNotify = {
             attemptedAt: nowString(),
             mock: true,
             overallOk: false,
             overallError: msg,
-            perRecipient: mentions.map((m) => ({
+            perRecipient: recipientsForNotify.map((m) => ({
               email: m.email,
               name: m.name,
               ok: false,
@@ -1459,30 +3059,39 @@ export default function Page() {
         }
       }
 
-      const comment: StepComment = {
-        id: createId("comment"),
-        authorName: "나",
-        message: draft,
-        mentions,
-        createdAt: commentCreatedAt,
-      };
+      const comment: StepComment | null = text
+        ? {
+            id: createId("comment"),
+            authorName: "나",
+            message: draft.memo,
+            mentions,
+            createdAt: logCreatedAt,
+          }
+        : null;
 
-      const newLogs: NotificationLog[] = mentions.length
-        ? [
-            {
-              id: createId("log"),
-              kind: "mention",
-              projectCode: selectedProject.code,
-              phaseTitle: currentPhase?.title ?? "",
-              stepLabel: currentStep?.label ?? "",
-              authorName: "나",
-              commentText: draft,
-              recipients: mentions,
-              createdAt: commentCreatedAt,
-              emailNotify,
-            },
-          ]
-        : [];
+      const newLogs: NotificationLog[] =
+        recipientsForNotify.length > 0 && emailNotify
+          ? [
+              {
+                id: createId("log"),
+                kind: "mention",
+                projectCode: selectedProject.code,
+                phaseTitle: phase.title,
+                stepLabel: step.label,
+                authorName: "나",
+                commentText: notifyText,
+                stepLink,
+                recipients: recipientsForNotify,
+                createdAt: logCreatedAt,
+                emailNotify,
+              },
+            ]
+          : [];
+
+      let nextReminder = step.dueReminderSentAt;
+      if (draft.dueDate !== step.dueDate || !idSetsEqual(draft.assigneeMemberIds, step.assigneeMemberIds)) {
+        nextReminder = "";
+      }
 
       setProjects((prev) =>
         prev.map((project) => {
@@ -1492,18 +3101,21 @@ export default function Page() {
             updated: true,
             lastChangedAt: nowString(),
             notificationLogs: [...newLogs, ...project.notificationLogs],
-            phases: project.phases.map((phase) =>
-              phase.id !== phaseId
-                ? phase
+            phases: project.phases.map((ph) =>
+              ph.id !== phaseId
+                ? ph
                 : {
-                    ...phase,
-                    steps: phase.steps.map((step) =>
-                      step.id === stepId
-                        ? {
-                            ...step,
-                            comments: [comment, ...step.comments],
-                          }
-                        : step
+                    ...ph,
+                    steps: reconcilePhaseSteps(
+                      patchStepInTree(ph.steps, stepId, (s) => ({
+                        ...s,
+                        dueDate: draft.dueDate,
+                        confirmedAt: draft.confirmedAt,
+                        memo: draft.memo,
+                        assigneeMemberIds: [...draft.assigneeMemberIds],
+                        dueReminderSentAt: nextReminder,
+                        comments: comment ? [comment, ...s.comments] : s.comments,
+                      }))
                     ),
                   }
             ),
@@ -1511,9 +3123,20 @@ export default function Page() {
         })
       );
 
-      setCommentDraft(stepId, "");
+      setStepDrafts((prev) => ({
+        ...prev,
+        [stepId]: { ...draft },
+      }));
+
+      if (recipientsForNotify.length === 0) {
+        alert("저장은 완료됐지만 알림 대상이 없어 메일은 보내지 않았습니다.");
+      } else if (emailNotify?.overallOk) {
+        alert("저장 및 알림 전송 완료");
+      } else if (!notifyFetchThrew) {
+        alert("저장은 완료됐지만 알림 메일 발송은 실패했습니다.");
+      }
     } finally {
-      setSavingCommentStepId(null);
+      setSavingStepId(null);
     }
   }
 
@@ -1521,6 +3144,10 @@ export default function Page() {
     if (dueReminderBusy) return;
     setDueReminderBusy(true);
     try {
+      const appBaseUrl =
+        typeof window !== "undefined"
+          ? `${window.location.origin}${window.location.pathname}`
+          : undefined;
       const body = buildDueReminderProcessRequest(
         projects.map((p) => ({
           id: p.id,
@@ -1528,18 +3155,14 @@ export default function Page() {
           phases: p.phases.map((ph) => ({
             id: ph.id,
             title: ph.title,
-            steps: ph.steps.map((s) => ({
-              id: s.id,
-              label: s.label,
-              checked: s.checked,
-              dueDate: s.dueDate,
-              assigneeMemberId: s.assigneeMemberId,
-              dueReminderSentAt: s.dueReminderSentAt,
-            })),
+            steps: ph.steps.map((s) => stepToDueReminderInput(s)),
           })),
         })),
-        globalMembers.map((m) => ({ id: m.id, name: m.name, email: m.email }))
+        globalMembers.map((m) => ({ id: m.id, name: m.name, email: m.email })),
+        appBaseUrl
       );
+
+      console.log("[due-reminder] body", body);
 
       const res = await fetch("/api/due-reminders", {
         method: "POST",
@@ -1548,6 +3171,7 @@ export default function Page() {
       });
 
       const data = (await res.json()) as DueReminderProcessResponse & { error?: string };
+      console.log("[due-reminder] response", data);
       if (!res.ok) {
         throw new Error(data.error || `요청 실패 (${res.status})`);
       }
@@ -1563,11 +3187,13 @@ export default function Page() {
           const proj = prev.find((p) => p.id === r.projectId);
           if (!proj) continue;
           const phase = proj.phases.find((ph) => ph.id === r.phaseId);
-          const step = phase?.steps.find((s) => s.id === r.stepId);
+          const step = phase ? findStepInPhaseSteps(phase.steps, r.stepId) : undefined;
           if (!phase || !step) continue;
-          const assignee = globalMembers.find((m) => m.id === step.assigneeMemberId);
+          const rid = r.recipientMemberId ?? step.assigneeMemberIds[0];
+          const assignee = rid ? globalMembers.find((m) => m.id === rid) : undefined;
 
           const attemptedAt = r.sentAt || new Date().toISOString();
+          const stepLinkLine = buildFlowchartStepDeepLink(proj.id, step.id);
           const log: NotificationLog = {
             id: createId("log"),
             kind: "due_reminder",
@@ -1575,7 +3201,8 @@ export default function Page() {
             phaseTitle: phase.title,
             stepLabel: step.label,
             authorName: "Due Reminder",
-            commentText: `Due 24h 알림 · 마감: ${step.dueDate.replace("T", " ")}`,
+            stepLink: stepLinkLine,
+            commentText: `Due 24h 알림 · 마감: ${normalizeDateOnly(step.dueDate) || step.dueDate}\n\n열기: ${stepLinkLine}`,
             recipients: assignee
               ? [{ memberId: assignee.id, name: assignee.name, email: assignee.email }]
               : [],
@@ -1645,766 +3272,967 @@ export default function Page() {
   }
 
   return (
-    <div className="min-h-screen bg-[#f6f5f3] text-neutral-900">
-      <div className="mx-auto flex max-w-[1880px] gap-4 px-4 py-4">
-        <aside className="sticky top-4 z-40 flex h-[calc(100vh-2rem)] w-[340px] shrink-0 flex-col overflow-hidden rounded-[28px] border border-neutral-200 bg-white">
-          <div className="pointer-events-auto relative z-50 shrink-0 border-b border-neutral-200 px-5 py-5">
-            <div className="mb-2 flex items-center justify-end">
-              <button type="button" onClick={() => void handleLogout()} className="relative z-[60] cursor-pointer rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium text-neutral-600 pointer-events-auto hover:bg-neutral-50">
-                로그아웃
-              </button>
-            </div>
-            <div className="mb-1 text-[11px] uppercase tracking-[0.22em] text-neutral-500">Dashboard</div>
-            <div className="text-[30px] font-black tracking-[-0.05em]">FLOWCHART TEST</div>
-            <div className="mt-2 text-sm text-neutral-500">코드 중심 리스트 + 고정 15단계 플로우</div>
-          </div>
-
-          <div className="min-h-0 flex-1 overflow-y-auto border-b border-neutral-200 px-4 py-4">
+    <div className="flex h-screen bg-[#f6f5f3] text-neutral-900">
+      <aside className="flex min-h-0 w-[310px] shrink-0 flex-col border-r border-neutral-200 bg-white">
+        <div className="shrink-0 border-b border-neutral-200 px-3 py-3">
+          <div className="flex gap-2">
             <button
               type="button"
               onClick={() => setMemberPanelOpen((prev) => !prev)}
-              className="mb-3 w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm font-semibold"
+              className="flex-1 rounded-xl border border-neutral-200 px-3 py-2 text-sm font-medium"
             >
-              {memberPanelOpen ? "Hide Members" : "Show Members"}
+              Show Members
             </button>
+            <button
+              type="button"
+              onClick={() => void handleLogout()}
+              className="rounded-xl border border-neutral-200 px-3 py-2 text-sm font-medium"
+            >
+              로그아웃
+            </button>
+          </div>
+        </div>
 
-            {memberPanelOpen && (
-              <div className="relative z-0 mb-3 rounded-[22px] border border-neutral-200 bg-[#f8f7f5]">
-                <div className="flex items-center justify-between border-b border-neutral-200 px-3 py-3">
-                  <div className="text-sm font-semibold">Members</div>
-                  <div className="text-xs text-neutral-500">{globalMembers.length}명</div>
+        {memberPanelOpen ? (
+          <div className="max-h-[min(40vh,20rem)] shrink-0 overflow-y-auto border-b border-neutral-200 bg-[#f8f7f5] px-2 py-2">
+            <div className="mb-2 flex items-center justify-between px-1">
+              <div className="text-xs font-semibold">Members</div>
+              <div className="text-[10px] text-neutral-500">{globalMembers.length}명</div>
+            </div>
+            <div className="space-y-2">
+              {globalMembers.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-neutral-200 bg-white px-3 py-4 text-center text-xs text-neutral-400">
+                  등록된 멤버가 없습니다.
                 </div>
-
-                <div className="max-h-[min(55vh,36rem)] space-y-4 overflow-y-auto p-3">
-                  <div className="space-y-2">
-                    {globalMembers.length === 0 ? (
-                      <div className="rounded-2xl border border-dashed border-neutral-200 bg-white px-4 py-5 text-center text-sm text-neutral-400">
-                        등록된 멤버가 없습니다.
+              ) : (
+                globalMembers.map((member) => (
+                  <div
+                    key={member.id}
+                    className="flex items-center justify-between gap-2 rounded-xl border border-neutral-200 bg-white px-2 py-2"
+                  >
+                    <div className="min-w-0 flex items-center gap-2">
+                      <MemberInitial name={member.name} />
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-1">
+                          <span className="truncate text-xs font-semibold">{member.name}</span>
+                          {member.userId &&
+                          authUserId &&
+                          member.userId === authUserId &&
+                          (!authUserEmail?.trim() ||
+                            member.email.trim().toLowerCase() === authUserEmail.trim().toLowerCase()) ? (
+                            <span className="shrink-0 rounded bg-emerald-100 px-1 py-0.5 text-[9px] font-semibold text-emerald-800">
+                              나
+                            </span>
+                          ) : null}
+                          {isMemberOnline(member.lastSeenAt) ? (
+                            <span className="shrink-0 rounded bg-sky-100 px-1 py-0.5 text-[9px] font-semibold text-sky-800">
+                              접속
+                            </span>
+                          ) : null}
+                        </div>
+                        <div className="truncate text-[10px] text-neutral-500">{member.email}</div>
                       </div>
-                    ) : (
-                      globalMembers.map((member) => (
-                        <div
-                          key={member.id}
-                          className="flex items-center justify-between gap-3 rounded-2xl border border-neutral-200 bg-white px-3 py-3"
-                        >
-                          <div className="min-w-0 flex items-center gap-3">
-                            <MemberInitial name={member.name} />
-                            <div className="min-w-0">
-                              <div className="flex flex-wrap items-center gap-1.5">
-                                <span className="truncate text-sm font-semibold">{member.name}</span>
-                                {member.userId &&
-                                authUserId &&
-                                member.userId === authUserId &&
-                                (!authUserEmail?.trim() ||
-                                  member.email.trim().toLowerCase() === authUserEmail.trim().toLowerCase()) ? (
-                                  <span className="shrink-0 rounded-md bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800">
-                                    나
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void removeGlobalMember(member.id)}
+                      disabled={
+                        !canDeleteMembers || Boolean(authUserId && member.userId && member.userId === authUserId)
+                      }
+                      className="shrink-0 rounded-lg border border-rose-200 bg-rose-50 px-2 py-1 text-[10px] font-medium text-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      삭제
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        ) : null}
+
+        <div className="shrink-0 border-b border-neutral-200 p-3">
+          <div className="grid grid-cols-[1fr_88px] overflow-hidden rounded-2xl border border-neutral-200">
+            <div className="flex items-center justify-center border-r border-neutral-200 bg-white px-4 py-8">
+              <div className="text-[20px] font-black tracking-[-0.04em]">PROJECT</div>
+            </div>
+
+            <div className="flex flex-col bg-white">
+              <button
+                type="button"
+                onClick={createNewProjectFlow}
+                className="border-b border-neutral-200 px-3 py-3 text-left text-sm font-semibold"
+              >
+                NEW
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setSearchPanelOpen((prev) => !prev)}
+                className="border-b border-neutral-200 px-3 py-3 text-left text-sm font-semibold"
+              >
+                SEARCH
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setFilterPanelOpen((prev) => !prev)}
+                className="border-b border-neutral-200 px-3 py-3 text-left text-sm font-semibold"
+              >
+                FILTER
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setAllProjectsExpanded(true)}
+                className="px-3 py-3 text-left text-sm font-semibold text-red-500"
+              >
+                &gt;&gt;
+              </button>
+            </div>
+          </div>
+
+          {searchPanelOpen ? (
+            <div className="mt-3">
+              <input
+                value={sidebarSearch}
+                onChange={(e) => setSidebarSearch(e.target.value)}
+                placeholder="Search..."
+                className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm outline-none"
+              />
+            </div>
+          ) : null}
+
+          {filterPanelOpen ? (
+            <div className="mt-3 rounded-2xl border border-neutral-200 bg-[#faf9f7] p-2">
+              <SidebarFilterAccordion
+                projects={projects}
+                selectOptions={selectOptions}
+                sidebarFilters={sidebarFilters}
+                toggleSidebarFilterValue={toggleSidebarFilterValue}
+              />
+            </div>
+          ) : null}
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto p-3">
+          <div className="space-y-3">
+            {sidebarFilteredProjects.map((project) => {
+              const isSelected = project.id === selectedId;
+
+              return (
+                <button
+                  key={project.id}
+                  type="button"
+                  onClick={() => {
+                    setSelectedId(project.id);
+                    setAllProjectsExpanded(false);
+                  }}
+                  className={[
+                    "w-full rounded-2xl border px-4 py-4 text-left transition",
+                    isSelected
+                      ? "border-neutral-900 bg-[#eef3ef] shadow-sm"
+                      : "border-neutral-200 bg-white hover:bg-neutral-50",
+                  ].join(" ")}
+                >
+                  <div className="text-[15px] font-bold tracking-[-0.03em] text-neutral-900">
+                    {project.code?.trim() || "(NO CODE)"}
+                  </div>
+                  <ProjectProgressRow project={project} />
+                </button>
+              );
+            })}
+
+            {sidebarFilteredProjects.length === 0 ? (
+              <div className="rounded-2xl border border-dashed border-neutral-200 bg-white px-4 py-10 text-center text-sm text-neutral-500">
+                검색 또는 필터 결과가 없습니다.
+              </div>
+            ) : null}
+          </div>
+        </div>
+
+        <OptionManageModal
+          open={optionManageField !== null}
+          field={optionManageField}
+          title={
+            optionManageField === "items"
+              ? "ITEM"
+              : optionManageField === "countries"
+                ? "COUNTRY"
+                : optionManageField === "certificates"
+                  ? "CERTIFICATE"
+                  : optionManageField === "businessModels"
+                    ? "BUSINESS MODEL"
+                    : optionManageField === "incoterms"
+                      ? "INCOTERMS"
+                      : optionManageField === "exporters"
+                        ? "EXPORTER"
+                        : optionManageField === "clients"
+                          ? "CLIENT"
+                          : optionManageField === "hsCodes"
+                            ? "H.S CODE"
+                            : ""
+          }
+          options={selectOptions}
+          projects={projects}
+          onClose={() => setOptionManageField(null)}
+          onRemoveOption={(field, value) => {
+            removeOption(field, value);
+          }}
+          onAddOption={handleAddOption}
+        />
+      </aside>
+
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {allProjectsExpanded ? (
+          <div className="flex min-h-0 flex-1 flex-col overflow-hidden bg-[#f6f5f3]">
+            <div className="shrink-0 border-b border-neutral-200 bg-white px-6 py-4">
+              <div className="mx-auto w-full max-w-[1600px]">
+                <ProjectExplorerFilterBar
+                  projects={projects}
+                  selectOptions={selectOptions}
+                  detailSearch={detailSearch}
+                  setDetailSearch={setDetailSearch}
+                  detailFilters={detailFilters}
+                  toggleDetailFilterValue={toggleDetailFilterValue}
+                  overviewSortBy={overviewSortBy}
+                  setOverviewSortBy={setOverviewSortBy}
+                />
+                <div className="mt-4 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setAllProjectsExpanded(false)}
+                    className="rounded-xl border border-neutral-900 bg-neutral-900 px-4 py-2 text-sm font-semibold text-white"
+                  >
+                    상세 화면으로
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div className="min-h-0 flex-1 overflow-x-auto overflow-y-auto p-6">
+              {boardGroups.length === 0 ? (
+                <div className="flex min-h-[260px] items-center justify-center rounded-[28px] border border-dashed border-neutral-200 bg-white px-6 py-12 text-center text-sm text-neutral-500">
+                  {projects.length === 0 ? (
+                    <div>
+                      <div className="text-base font-semibold text-neutral-800">프로젝트가 없습니다.</div>
+                      <div className="mt-2 text-xs text-neutral-500">왼쪽에서 NEW로 추가하세요.</div>
+                    </div>
+                  ) : (
+                    <span>조건에 맞는 프로젝트가 없습니다. 필터·검색을 조정해 보세요.</span>
+                  )}
+                </div>
+              ) : (
+                <div className="flex min-w-max gap-6">
+                  {boardGroups.map(([itemName, list]) => (
+                    <section key={itemName} className="w-[280px] shrink-0">
+                      <div className="mb-4 flex items-center gap-3">
+                        <span className="rounded-full bg-[#dbe9df] px-3 py-1 text-sm font-semibold text-neutral-800">
+                          {itemName}
+                        </span>
+                        <span className="text-sm text-neutral-500">{list.length}</span>
+                      </div>
+
+                      <div className="space-y-3">
+                        {list.map((project) => {
+                          const isSelected = project.id === selectedId;
+
+                          return (
+                            <button
+                              key={project.id}
+                              type="button"
+                              onClick={() => {
+                                setSelectedId(project.id);
+                                setAllProjectsExpanded(false);
+                              }}
+                              className={[
+                                "w-full rounded-[24px] border p-4 text-left shadow-sm transition",
+                                isSelected
+                                  ? "border-neutral-900 bg-[#eef3ef]"
+                                  : "border-neutral-200 bg-[#dfe8e3] hover:translate-y-[-1px]",
+                              ].join(" ")}
+                            >
+                              <div className="mb-3 text-[18px] font-bold tracking-[-0.03em]">
+                                {project.code?.trim() || "(NO CODE)"}
+                              </div>
+
+                              <div className="mb-2 flex flex-wrap gap-2">
+                                {project.country?.trim() ? (
+                                  <span className="rounded-md bg-white/50 px-2 py-1 text-xs font-medium text-neutral-700">
+                                    {project.country}
                                   </span>
                                 ) : null}
-                                {isMemberOnline(member.lastSeenAt) ? (
-                                  <span className="shrink-0 rounded-md bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-800">
-                                    접속중
+
+                                {project.exporter?.trim() ? (
+                                  <span className="rounded-md bg-white/50 px-2 py-1 text-xs font-medium text-neutral-700">
+                                    {project.exporter}
+                                  </span>
+                                ) : null}
+
+                                {project.client?.trim() ? (
+                                  <span className="rounded-md bg-white/50 px-2 py-1 text-xs font-medium text-neutral-700">
+                                    {project.client}
                                   </span>
                                 ) : null}
                               </div>
-                              <div className="truncate text-xs text-neutral-500">{member.email}</div>
+
+                              <div className="mb-3 min-h-[40px] text-sm leading-6 text-neutral-700">
+                                {project.note?.trim() || ""}
+                              </div>
+                              <ProjectProgressRow project={project} />
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </section>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="h-full min-h-0 flex-1 overflow-y-auto bg-[#f6f5f3]">
+            {selectedProject ? (
+              <div className="mx-auto w-full max-w-[1600px] px-8 py-6">
+                <div className="mb-8 flex flex-wrap items-start justify-between gap-4 border-b border-neutral-200 pb-6">
+                  <div className="min-w-0">
+                    <div className="text-[11px] uppercase tracking-[0.22em] text-neutral-500">Selected Project</div>
+
+                    <div className="mt-1 flex flex-wrap items-center gap-3">
+                      <input
+                        value={selectedProject.code}
+                        onChange={(e) => updateProjectField(selectedProject.id, "code", e.target.value)}
+                        placeholder="CODE"
+                        className="min-w-[180px] max-w-[360px] border-0 bg-transparent p-0 text-[32px] font-black tracking-[-0.05em] text-neutral-900 outline-none placeholder:text-neutral-300"
+                      />
+
+                      <select
+                        value={selectedProject.status}
+                        onChange={(e) => updateProjectField(selectedProject.id, "status", e.target.value as ProjectStatus)}
+                        className="h-9 rounded-lg border border-neutral-200 bg-white px-3 text-[12px] font-semibold text-neutral-700 outline-none"
+                      >
+                        <option value="REVIEW">REVIEW</option>
+                        <option value="IN PROGRESS">IN PROGRESS</option>
+                        <option value="HOLD">HOLD</option>
+                        <option value="DONE">DONE</option>
+                        <option value="DRAFT">DRAFT</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setAllProjectsExpanded(true)}
+                      className="shrink-0 rounded-xl border border-neutral-200 bg-white px-4 py-2.5 text-sm font-semibold text-neutral-900 shadow-sm"
+                    >
+                      전체 프로젝트 보기
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={deleteSelectedProject}
+                      className="shrink-0 rounded-xl border border-red-200 bg-white px-4 py-2.5 text-sm font-semibold text-red-500"
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                <span
+                  className={"rounded-md px-2 py-0.5 text-[10px] font-semibold " + itemPillStyle(selectedProject.item)}
+                >
+                  {selectedProject.item ?? "-"}
+                </span>
+                <span className="text-[10px] text-neutral-500">
+                  {selectedProgress.percent}% · {selectedProject.lastChangedAt}
+                </span>
+              </div>
+
+              <>
+                  <div className="mb-4 grid grid-cols-1 gap-2.5 md:grid-cols-2 xl:grid-cols-5">
+                    <Field label="ITEM">
+                      <CreatableSelect
+                        showAllClearOption
+                        value={selectedProject.item}
+                        options={selectOptions.items}
+                        onChange={(v) => updateProjectField(selectedProject.id, "item", v)}
+                        onCreate={(raw) => handleCreatableCreate("items", "item", raw)}
+                        onOpenManage={() => setOptionManageField("items")}
+                        placeholder="ITEM"
+                      />
+                    </Field>
+
+                    <Field label="COUNTRY">
+                      <CreatableSelect
+                        showAllClearOption
+                        value={selectedProject.country}
+                        options={selectOptions.countries}
+                        onChange={(v) => updateProjectField(selectedProject.id, "country", v)}
+                        onCreate={(raw) => handleCreatableCreate("countries", "country", raw)}
+                        onOpenManage={() => setOptionManageField("countries")}
+                        placeholder="COUNTRY"
+                      />
+                    </Field>
+
+                    <Field label="CERTIFICATE">
+                      <CreatableSelect
+                        showAllClearOption
+                        value={selectedProject.certificate}
+                        options={selectOptions.certificates}
+                        onChange={(v) => updateProjectField(selectedProject.id, "certificate", v)}
+                        onCreate={(raw) => handleCreatableCreate("certificates", "certificate", raw)}
+                        onOpenManage={() => setOptionManageField("certificates")}
+                        placeholder="CERTIFICATE"
+                      />
+                    </Field>
+
+                    <Field label="EXPORTER">
+                      <CreatableSelect
+                        showAllClearOption
+                        value={selectedProject.exporter}
+                        options={selectOptions.exporters}
+                        onChange={(v) => updateProjectField(selectedProject.id, "exporter", v)}
+                        onCreate={(raw) => handleCreatableCreate("exporters", "exporter", raw)}
+                        onOpenManage={() => setOptionManageField("exporters")}
+                        placeholder="EXPORTER"
+                      />
+                    </Field>
+
+                    <Field label="CLIENT">
+                      <CreatableSelect
+                        showAllClearOption
+                        value={selectedProject.client}
+                        options={selectOptions.clients}
+                        onChange={(v) => updateProjectField(selectedProject.id, "client", v)}
+                        onCreate={(raw) => handleCreatableCreate("clients", "client", raw)}
+                        onOpenManage={() => setOptionManageField("clients")}
+                        placeholder="CLIENT"
+                      />
+                    </Field>
+
+                    <Field label="BUSINESS MODEL">
+                      <CreatableSelect
+                        showAllClearOption
+                        value={selectedProject.businessModel}
+                        options={selectOptions.businessModels}
+                        onChange={(v) => updateProjectField(selectedProject.id, "businessModel", v)}
+                        onCreate={(raw) => handleCreatableCreate("businessModels", "businessModel", raw)}
+                        onOpenManage={() => setOptionManageField("businessModels")}
+                        placeholder="BUSINESS MODEL"
+                      />
+                    </Field>
+
+                    <Field label="H.S CODE">
+                      <CreatableSelect
+                        showAllClearOption
+                        value={selectedProject.hsCode}
+                        options={selectOptions.hsCodes}
+                        onChange={(v) => updateProjectField(selectedProject.id, "hsCode", v)}
+                        onCreate={(raw) => handleCreatableCreate("hsCodes", "hsCode", raw)}
+                        onOpenManage={() => setOptionManageField("hsCodes")}
+                        placeholder="H.S CODE"
+                      />
+                    </Field>
+
+                    <Field label="INCOTERMS">
+                      <CreatableSelect
+                        showAllClearOption
+                        value={selectedProject.incoterms}
+                        options={selectOptions.incoterms}
+                        onChange={(v) => updateProjectField(selectedProject.id, "incoterms", v)}
+                        onCreate={(raw) => handleCreatableCreate("incoterms", "incoterms", raw)}
+                        onOpenManage={() => setOptionManageField("incoterms")}
+                        placeholder="INCOTERMS"
+                      />
+                    </Field>
+
+                    <Field label="CUSTOM">
+                      <PercentInputField
+                        value={selectedProject.customRate}
+                        onChange={(v) => updateProjectField(selectedProject.id, "customRate", v)}
+                        placeholder="8"
+                      />
+                    </Field>
+
+                    <Field label="VAT">
+                      <PercentInputField
+                        value={selectedProject.vatRate}
+                        onChange={(v) => updateProjectField(selectedProject.id, "vatRate", v)}
+                        placeholder="10"
+                      />
+                    </Field>
+
+                    <Field label="ETD">
+                      <Input
+                        type="date"
+                        value={selectedProject.etd}
+                        onChange={(v) => updateProjectField(selectedProject.id, "etd", v)}
+                      />
+                    </Field>
+
+                    <Field label="ETA">
+                      <Input
+                        type="date"
+                        value={selectedProject.eta}
+                        onChange={(v) => updateProjectField(selectedProject.id, "eta", v)}
+                      />
+                    </Field>
+
+                    <PriceField
+                      label="PRICE"
+                      value={selectedProject.priceValue}
+                      currency={selectedProject.priceCurrency}
+                      unit={selectedProject.priceUnit}
+                      onValueChange={(v) => updateProjectField(selectedProject.id, "priceValue", v)}
+                      onCurrencyChange={(v) => updateProjectField(selectedProject.id, "priceCurrency", v)}
+                      onUnitChange={(v) => updateProjectField(selectedProject.id, "priceUnit", v)}
+                      placeholder="7.9"
+                    />
+
+                    <PriceField
+                      label="OFFER PRICE"
+                      value={selectedProject.offerPriceValue}
+                      currency={selectedProject.offerPriceCurrency}
+                      unit={selectedProject.offerPriceUnit}
+                      onValueChange={(v) => updateProjectField(selectedProject.id, "offerPriceValue", v)}
+                      onCurrencyChange={(v) => updateProjectField(selectedProject.id, "offerPriceCurrency", v)}
+                      onUnitChange={(v) => updateProjectField(selectedProject.id, "offerPriceUnit", v)}
+                      placeholder="8.3"
+                    />
+
+                    <PriceField
+                      label="FINAL PRICE"
+                      value={selectedProject.finalPriceValue}
+                      currency={selectedProject.finalPriceCurrency}
+                      unit={selectedProject.finalPriceUnit}
+                      onValueChange={(v) => updateProjectField(selectedProject.id, "finalPriceValue", v)}
+                      onCurrencyChange={(v) => updateProjectField(selectedProject.id, "finalPriceCurrency", v)}
+                      onUnitChange={(v) => updateProjectField(selectedProject.id, "finalPriceUnit", v)}
+                      placeholder="7.6"
+                    />
+                  </div>
+
+                  <details className="mb-4 rounded-xl border border-dashed border-neutral-200 bg-neutral-50/80 px-3 py-1.5">
+                    <summary className="cursor-pointer list-none text-[10px] font-medium text-neutral-500 marker:hidden [&::-webkit-details-marker]:hidden">
+                      <span className="underline decoration-neutral-300 decoration-dotted underline-offset-2">
+                        NOTE (선택 · 플로우 메모)
+                      </span>
+                    </summary>
+                    <div className="mt-2 border-t border-neutral-200/80 pt-2">
+                      <TextArea
+                        value={selectedProject.note}
+                        onChange={(v) =>
+                          setProjects((prev) =>
+                            prev.map((p) =>
+                              p.id === selectedProject.id
+                                ? { ...p, note: v, updated: true, lastChangedAt: nowString() }
+                                : p
+                            )
+                          )
+                        }
+                        placeholder="필요할 때만 입력"
+                        rows={2}
+                      />
+                    </div>
+                  </details>
+              </>
+
+
+            <div className="flex flex-col gap-4">
+              <section className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <div className="rounded-[22px] border border-neutral-200 bg-white p-4">
+                  <div className="text-[11px] uppercase tracking-[0.18em] text-neutral-500">Progress</div>
+                  <div className="mt-2 text-[26px] font-black">
+                    {selectedProgress.done}/{selectedProgress.total}
+                  </div>
+                  <div className="mt-3 h-2.5 rounded-full bg-neutral-200">
+                    <div className="h-2.5 rounded-full bg-slate-900" style={{ width: `${selectedProgress.percent}%` }} />
+                  </div>
+                </div>
+
+                <div className="rounded-[22px] border border-neutral-200 bg-white p-4">
+                  <div className="text-[11px] uppercase tracking-[0.18em] text-neutral-500">Next Due</div>
+                  {selectedNextDue ? (
+                    <>
+                      <div className="mt-2 text-[15px] font-bold">{selectedNextDue.label}</div>
+                      <div className="mt-1 text-sm text-neutral-500">{selectedNextDue.dueDate}</div>
+                    </>
+                  ) : (
+                    <div className="mt-2 text-sm text-neutral-500">No due scheduled</div>
+                  )}
+                </div>
+
+                <div className="rounded-[22px] border border-neutral-200 bg-white p-4">
+                  <div className="text-[11px] uppercase tracking-[0.18em] text-neutral-500">Overdue</div>
+                  <div className={`mt-2 text-[26px] font-black ${selectedOverdueCount > 0 ? "text-rose-600" : "text-neutral-900"}`}>
+                    {selectedOverdueCount}
+                  </div>
+                  <div className="mt-1 text-sm text-neutral-500">unchecked steps</div>
+                </div>
+              </section>
+
+              <section className="rounded-[26px] border border-neutral-200 bg-white p-4 sm:p-5">
+                <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="text-[13px] uppercase tracking-[0.2em] text-neutral-500">FLOWCHART</div>
+                  <button
+                    type="button"
+                    disabled={dueReminderBusy}
+                    onClick={() => {
+                      void runDueReminderScan();
+                    }}
+                    className="shrink-0 rounded-xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2 text-xs font-medium text-neutral-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {dueReminderBusy ? "Due 알림 검사 중…" : "Due 24h 알림 검사 (API)"}
+                  </button>
+                </div>
+
+                <div className="overflow-x-auto rounded-xl border border-neutral-200">
+                  <div className="min-w-[1420px]">
+                    <div
+                      className="grid grid-cols-[36px_52px_44px_minmax(280px,360px)_150px_150px_150px_minmax(280px,1fr)_72px_72px] gap-x-2 border-b border-neutral-200 bg-[#f8f7f5] px-2 py-2 text-[11px] font-semibold uppercase tracking-[0.1em] text-neutral-500"
+                    >
+                      <div />
+                      <div className="text-center">N/A</div>
+                      <div />
+                      <div>Process</div>
+                      <div>Due Date</div>
+                      <div>Confirmed At</div>
+                      <div>Assignee</div>
+                      <div>Remark</div>
+                      <div />
+                      <div />
+                    </div>
+
+                    {buildAllFlowchartVisibleRows(selectedProject.phases).map(
+                      ({ phaseId, step, depth, displayIndex, isChildRow }) => {
+                        const overdue = !step.checked && !!step.dueDate && isOverdue(step.dueDate);
+                        const dueSoonLabel = !step.checked && !overdue ? getDueSoonLabel(step.dueDate) : null;
+                        const draft = stepDrafts[step.id] ?? stepToDraft(step);
+                        const mentionQuery = extractMentionQuery(draft.memo);
+                        const mentionCandidates =
+                          mentionQuery !== null
+                            ? globalMembers.filter(
+                                (member) =>
+                                  member.name.toLowerCase().includes(mentionQuery.toLowerCase()) ||
+                                  member.email.toLowerCase().includes(mentionQuery.toLowerCase())
+                              )
+                            : [];
+
+                        const rowHighlight = highlightedStepId === step.id;
+                        const rowSurface = step.notApplicable
+                          ? rowHighlight
+                            ? "bg-neutral-100/95 ring-2 ring-blue-200 ring-inset"
+                            : isChildRow
+                              ? "bg-neutral-100"
+                              : "bg-neutral-50/90"
+                          : overdue && rowHighlight
+                            ? "bg-rose-50/60 ring-2 ring-blue-200 ring-inset"
+                            : overdue
+                              ? isChildRow
+                                ? "bg-rose-50/70"
+                                : "bg-rose-50/60"
+                              : rowHighlight
+                                ? "bg-blue-50/40 ring-2 ring-blue-200 ring-inset"
+                                : isChildRow
+                                  ? "bg-[#f1f1f1]"
+                                  : "bg-white";
+
+                        return (
+                          <div
+                            key={step.id}
+                            id={`step-${step.id}`}
+                            className={
+                              "grid grid-cols-[36px_52px_44px_minmax(280px,360px)_150px_150px_150px_minmax(280px,1fr)_72px_72px] items-start gap-x-2 border-b border-neutral-200 px-2 py-1.5 " +
+                              rowSurface
+                            }
+                          >
+                            <div className="flex justify-center pt-1">
+                              <input
+                                type="checkbox"
+                                checked={step.checked}
+                                disabled={step.notApplicable}
+                                onChange={(e) =>
+                                  toggleStepChecked(selectedProject.id, phaseId, step.id, e.target.checked)
+                                }
+                                className="h-4 w-4 accent-blue-600 disabled:cursor-not-allowed disabled:opacity-60"
+                                aria-label={`완료: ${step.label}`}
+                              />
+                            </div>
+                            <div className="flex justify-center pt-1">
+                              <input
+                                type="checkbox"
+                                checked={step.notApplicable}
+                                onChange={(e) =>
+                                  toggleStepNotApplicable(
+                                    selectedProject.id,
+                                    phaseId,
+                                    step.id,
+                                    e.target.checked
+                                  )
+                                }
+                                className="h-4 w-4 accent-neutral-500"
+                                aria-label={`해당 없음(N/A): ${step.label}`}
+                              />
+                            </div>
+                            <div
+                              className={`pt-1 text-center tabular-nums ${
+                                isChildRow
+                                  ? "text-sm font-semibold text-neutral-300"
+                                  : "text-[15px] font-extrabold text-neutral-800"
+                              }`}
+                            >
+                              {displayIndex || "\u00a0"}
+                            </div>
+                            <div
+                              className="flex min-w-0 items-start gap-1.5 py-1 text-left text-[15px] font-medium text-neutral-900"
+                              style={isChildRow ? { paddingLeft: 8 + Math.max(0, depth - 1) * 8 } : undefined}
+                            >
+                              {step.subSteps && step.subSteps.length > 0 ? (
+                                <button
+                                  type="button"
+                                  onClick={() => toggleStepExpanded(selectedProject.id, phaseId, step.id)}
+                                  className="h-7 w-7 shrink-0 rounded-md text-sm text-neutral-500 hover:bg-neutral-200/80 hover:text-neutral-800"
+                                  aria-expanded={Boolean(step.expanded)}
+                                  aria-label={step.expanded ? "하위 접기" : "하위 펼치기"}
+                                >
+                                  {step.expanded ? "▼" : "▶"}
+                                </button>
+                              ) : (
+                                <span
+                                  className="inline-flex h-7 w-7 shrink-0 items-center justify-center text-neutral-300"
+                                  aria-hidden
+                                >
+                                  ·
+                                </span>
+                              )}
+
+                              {isChildRow ? (
+                                <span className="shrink-0 text-[12px] font-semibold text-neutral-400">└</span>
+                              ) : null}
+
+                              <span
+                                className={`min-w-0 ${
+                                  isChildRow
+                                    ? "text-[14px] font-medium text-neutral-700"
+                                    : "text-[15px] font-extrabold tracking-[-0.02em] text-neutral-900"
+                                }`}
+                                style={{
+                                  whiteSpace: "normal",
+                                  overflowWrap: "anywhere",
+                                  wordBreak: "keep-all",
+                                  lineHeight: 1.25,
+                                }}
+                              >
+                                {step.label}
+                              </span>
+
+                              {step.subSteps?.length ? (
+                                <span className="shrink-0 rounded bg-neutral-100 px-1.5 py-0.5 text-[10px] font-semibold text-neutral-500">
+                                  {step.subSteps.length}
+                                </span>
+                              ) : null}
+
+                              {step.notApplicable ? (
+                                <span className="shrink-0 rounded border border-neutral-200 bg-neutral-100/90 px-1 py-0.5 text-[10px] font-semibold text-neutral-600">
+                                  N/A
+                                </span>
+                              ) : null}
+
+                              {overdue ? (
+                                <span className="shrink-0 rounded border border-rose-200 bg-rose-50 px-1 py-0.5 text-[10px] font-semibold text-rose-700">
+                                  OVERDUE
+                                </span>
+                              ) : null}
+
+                              {!overdue && dueSoonLabel ? (
+                                <span className="shrink-0 rounded border border-emerald-300 bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800">
+                                  {dueSoonLabel}
+                                </span>
+                              ) : null}
+                            </div>
+                            <div className="rounded border border-neutral-200 px-1.5 py-1 pt-1.5">
+                              <Input
+                                type="date"
+                                value={draft.dueDate}
+                                onChange={(v) => patchStepDraft(step.id, { dueDate: v }, step)}
+                                className="text-[14px]"
+                              />
+                            </div>
+                            <div className="rounded border border-neutral-200 px-1.5 py-1 pt-1.5">
+                              <Input
+                                type="date"
+                                value={draft.confirmedAt}
+                                onChange={(v) => patchStepDraft(step.id, { confirmedAt: v }, step)}
+                                className="text-[14px]"
+                              />
+                            </div>
+                            <div className="min-w-0 pt-1">
+                              <AssigneeMultiSelect
+                                compact
+                                members={globalMembers}
+                                selectedIds={draft.assigneeMemberIds}
+                                onChange={(next) => patchStepDraft(step.id, { assigneeMemberIds: next }, step)}
+                              />
+                            </div>
+                            <div className="relative min-w-0 pt-1">
+                              <TextArea
+                                value={draft.memo}
+                                onChange={(v) => patchStepDraft(step.id, { memo: v }, step)}
+                                placeholder="@멘션 · 확인 시 저장"
+                                rows={2}
+                                className="min-h-[38px] py-1 text-[13px] leading-snug"
+                              />
+                              {mentionQuery !== null && mentionCandidates.length > 0 && (
+                                <div className="absolute left-0 right-0 top-full z-30 mt-0.5 max-h-40 overflow-y-auto rounded-lg border border-neutral-200 bg-white p-1.5 shadow-lg">
+                                  {mentionCandidates.map((member) => (
+                                    <button
+                                      key={member.id}
+                                      type="button"
+                                      onClick={() => applyMentionToDraft(step.id, member, step)}
+                                      className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-neutral-50"
+                                    >
+                                      <MemberInitial name={member.name} />
+                                      <span className="truncate font-medium">{member.name}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                            <div className="flex justify-center pt-1">
+                              <button
+                                type="button"
+                                onClick={() => resetStepDraftFields(step.id)}
+                                className="rounded-lg border border-rose-200 bg-rose-50 px-2 py-1.5 text-[10px] font-medium text-rose-700"
+                              >
+                                초기화
+                              </button>
+                            </div>
+                            <div className="flex justify-center pt-1">
+                              <button
+                                type="button"
+                                disabled={savingStepId === step.id}
+                                onClick={() => void saveStepDraft(selectedProject.id, phaseId, step.id)}
+                                className="rounded-lg border border-slate-900 bg-slate-900 px-2 py-1.5 text-[10px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                {savingStepId === step.id ? "…" : "확인"}
+                              </button>
                             </div>
                           </div>
+                        );
+                      })}
+                  </div>
+                </div>
+              </section>
+            </div>
 
-                          <button
-                            type="button"
-                            onClick={() => void removeGlobalMember(member.id)}
-                            disabled={
-                              !canDeleteMembers ||
-                              Boolean(authUserId && member.userId && member.userId === authUserId)
-                            }
-                            className="rounded-xl border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
-                          >
-                            삭제
-                          </button>
+
+            <section className="space-y-4">
+              <section className="rounded-[26px] border border-neutral-200 bg-white p-4">
+                <div className="mb-3 flex items-start justify-between gap-3">
+                  <div>
+                    <div className="mb-1 text-[11px] uppercase tracking-[0.22em] text-neutral-500">Update Log</div>
+                    <h2 className="text-[20px] font-bold tracking-[-0.03em]">Email Log</h2>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setEmailLogOpen((prev) => !prev)}
+                    className="rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium"
+                  >
+                    {emailLogOpen ? "Hide" : "Show"}
+                  </button>
+                </div>
+
+                {emailLogOpen ? (
+                  <div className="space-y-2">
+                    {selectedProject.notificationLogs.length === 0 ? (
+                      <div className="rounded-xl border border-dashed border-neutral-200 bg-[#faf9f7] px-3 py-4 text-center text-xs text-neutral-400">
+                        아직 이메일 알림 로그가 없습니다.
+                      </div>
+                    ) : (
+                      selectedProject.notificationLogs.map((log) => (
+                        <div
+                          key={log.id}
+                          className="rounded-xl border border-neutral-200 bg-[#faf9f7] px-3 py-2.5"
+                        >
+                          <div className="text-sm font-semibold leading-tight">{log.stepLabel}</div>
+                          <div className="mt-0.5 flex flex-wrap items-baseline gap-x-2 gap-y-0 text-xs text-neutral-500">
+                            <span>{log.phaseTitle}</span>
+                            <span className="text-neutral-400">{log.createdAt}</span>
+                          </div>
+                          <div className="mt-1 text-xs leading-snug text-neutral-600">
+                            {log.kind === "due_reminder" ? (
+                              <>
+                                <span className="font-medium">{log.authorName}</span>
+                                {log.recipients.length > 0
+                                  ? ` → ${log.recipients.map((r) => `${r.name} (${r.email})`).join(", ")}`
+                                  : null}
+                              </>
+                            ) : (
+                              <>
+                                <span className="font-medium">{log.authorName}</span> mentioned{" "}
+                                {log.recipients.map((r) => `@${r.name}`).join(", ")}
+                              </>
+                            )}
+                          </div>
+                          <div className="mt-1 text-sm leading-snug text-neutral-700">{log.commentText}</div>
+                          {log.stepLink ? (
+                            <div className="mt-2">
+                              <a
+                                href={log.stepLink}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-flex items-center rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-800 underline-offset-2 hover:bg-slate-50 hover:underline"
+                              >
+                                열기
+                              </a>
+                            </div>
+                          ) : null}
+                          {log.emailNotify && (
+                            <div className="mt-1.5 border-t border-neutral-200/90 pt-1.5 text-[11px] leading-snug text-neutral-600">
+                              <div
+                                className={
+                                  log.emailNotify.overallOk ? "font-medium text-emerald-700" : "font-medium text-rose-700"
+                                }
+                              >
+                                이메일:{" "}
+                                {log.emailNotify.mock ? "[MOCK] " : ""}
+                                {log.emailNotify.overallOk ? "발송 성공" : "발송 실패"}
+                                {log.emailNotify.attemptedAt ? ` · ${log.emailNotify.attemptedAt}` : ""}
+                              </div>
+                              {log.emailNotify.overallError ? (
+                                <div className="mt-0.5 text-rose-600">{log.emailNotify.overallError}</div>
+                              ) : null}
+                              {log.emailNotify.perRecipient.some((r) => !r.ok) ? (
+                                <ul className="mt-0.5 list-inside list-disc text-neutral-500">
+                                  {log.emailNotify.perRecipient
+                                    .filter((r) => !r.ok)
+                                    .map((r) => (
+                                      <li key={r.email}>
+                                        {r.name} ({r.email}){r.error ? ` — ${r.error}` : ""}
+                                      </li>
+                                    ))}
+                                </ul>
+                              ) : null}
+                            </div>
+                          )}
                         </div>
                       ))
                     )}
                   </div>
-                </div>
-              </div>
-            )}
-
-            <button
-              type="button"
-              onClick={openCreatePanel}
-              className="mb-3 w-full rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white"
-            >
-              + New Project
-            </button>
-
-            {panelOpen && (
-              <div className="relative z-10 mb-3 rounded-[22px] border border-neutral-200 bg-[#f8f7f5]">
-                <div className="flex items-center justify-between border-b border-neutral-200 px-3 py-3">
-                  <div className="text-sm font-semibold">
-                    {formMode === "create" ? "Create Project" : "Edit Project"}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setPanelOpen(false);
-                      setEditingId(null);
-                      setForm(emptyForm());
-                    }}
-                    className="rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium"
-                  >
-                    Close
-                  </button>
-                </div>
-
-                <div className="max-h-[55vh] space-y-3 overflow-y-auto p-3">
-                  <Field label="CODE">
-                    <Input
-                      value={form.code || ""}
-                      onChange={(v) => setForm((prev) => ({ ...prev, code: v }))}
-                      placeholder="예: DRAFT 또는 TATAMA-84"
-                    />
-                  </Field>
-
-                  <Field label="STATUS">
-                    <Select
-                      value={form.status || "DRAFT"}
-                      onChange={(v) => setForm((prev) => ({ ...prev, status: v as ProjectStatus }))}
-                      options={["DRAFT", "REVIEW", "IN PROGRESS", "HOLD", "DONE"]}
-                    />
-                  </Field>
-
-                  <Field label="COUNTRY">
-                    <Input
-                      value={form.country || ""}
-                      onChange={(v) => setForm((prev) => ({ ...prev, country: v }))}
-                      placeholder="COUNTRY"
-                    />
-                  </Field>
-
-                  <Field label="EXPORTER">
-                    <Input
-                      value={form.exporter || ""}
-                      onChange={(v) => setForm((prev) => ({ ...prev, exporter: v }))}
-                      placeholder="EXPORTER"
-                    />
-                  </Field>
-
-                  <Field label="ITEM">
-                    <Select
-                      value={form.item || "GREEN BEAN"}
-                      onChange={(v) => setForm((prev) => ({ ...prev, item: v }))}
-                      options={ITEM_OPTIONS}
-                    />
-                  </Field>
-
-                  <Field label="CLIENT">
-                    <Input
-                      value={form.client || ""}
-                      onChange={(v) => setForm((prev) => ({ ...prev, client: v }))}
-                      placeholder="CLIENT"
-                    />
-                  </Field>
-
-                  <Field label="NOTE">
-                    <TextArea
-                      value={form.note || ""}
-                      onChange={(v) => setForm((prev) => ({ ...prev, note: v }))}
-                      placeholder="NOTE"
-                      rows={4}
-                    />
-                  </Field>
-                </div>
-
-                <div className="border-t border-neutral-200 bg-[#f8f7f5] p-3">
-                  <button
-                    onClick={saveProject}
-                    type="button"
-                    className="w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm font-semibold"
-                  >
-                    {formMode === "create" ? "Create Project" : "Save Changes"}
-                  </button>
-                </div>
-              </div>
-            )}
-
-            <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-4 py-3">
-              <Input value={search} onChange={setSearch} placeholder="Search code / exporter / item / client" />
-            </div>
-
-            <button
-              onClick={() => setFilterOpen((prev) => !prev)}
-              className="mt-3 w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm font-semibold"
-            >
-              {filterOpen ? "Hide Filters" : "Show Filters"}
-            </button>
-
-            {filterOpen && (
-              <div className="mt-3 grid grid-cols-2 gap-2">
-                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2">
-                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Status</div>
-                  <Select
-                    value={statusFilter}
-                    onChange={setStatusFilter}
-                    options={["ALL", "DRAFT", "REVIEW", "IN PROGRESS", "HOLD", "DONE"]}
-                  />
-                </div>
-
-                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2">
-                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Country</div>
-                  <Select value={countryFilter} onChange={setCountryFilter} options={countryOptions} />
-                </div>
-
-                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2">
-                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Item</div>
-                  <Select value={itemFilter} onChange={setItemFilter} options={itemOptions} />
-                </div>
-
-                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2">
-                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Client</div>
-                  <Select value={clientFilter} onChange={setClientFilter} options={clientOptions} />
-                </div>
-
-                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2">
-                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Exporter</div>
-                  <Select value={exporterFilter} onChange={setExporterFilter} options={exporterOptions} />
-                </div>
-
-                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2">
-                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Sort</div>
-                  <Select
-                    value={sortBy}
-                    onChange={(v) => setSortBy(v as SortOption)}
-                    options={["UPDATED_DESC", "CODE_ASC", "CODE_DESC", "PROGRESS_DESC"]}
-                  />
-                </div>
-
-                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2 col-span-2">
-                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Overdue</div>
-                  <Select value={overdueFilter} onChange={setOverdueFilter} options={["ALL", "YES", "NO"]} />
-                </div>
-              </div>
-            )}
-          </div>
-
-          <div className="max-h-[38vh] shrink-0 overflow-y-auto border-t border-neutral-200 px-3 py-3">
-            <div className="mb-3 flex items-center justify-between px-2">
-              <div className="text-sm font-semibold text-neutral-700">Projects</div>
-              <div className="text-xs text-neutral-500">{filteredProjects.length}</div>
-            </div>
-
-            <div className="space-y-2">
-              {filteredProjects.map((project) => {
-                const selected = project.id === selectedId;
-                const overdueCount = getOverdueCount(project);
-                const progress = getProjectProgress(project);
-
-                return (
-                  <button
-                    key={project.id}
-                    onClick={() => setSelectedId(project.id)}
-                    className={`group w-full rounded-[20px] border px-4 py-4 text-left transition ${
-                      selected
-                        ? "border-slate-900 bg-slate-900 text-white"
-                        : "border-neutral-200 bg-white hover:border-neutral-300"
-                    }`}
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-[22px] font-black tracking-[-0.04em]">{project.code}</div>
-
-                        <div
-                          className={`overflow-hidden transition-all duration-200 ${
-                            selected
-                              ? "mt-2 max-h-16 opacity-100"
-                              : "mt-0 max-h-0 opacity-0 group-hover:mt-2 group-hover:max-h-16 group-hover:opacity-100"
-                          }`}
-                        >
-                          <div className={`text-xs ${selected ? "text-white/75" : "text-neutral-500"}`}>
-                            {project.exporter || "-"} · {project.client || "-"}
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center gap-1.5 pt-1">
-                        {project.updated && (
-                          <span className={`h-2.5 w-2.5 rounded-full ${selected ? "bg-emerald-300" : "bg-emerald-500"}`} />
-                        )}
-                        {overdueCount > 0 && (
-                          <span
-                            className={`rounded-full px-2 py-1 text-[11px] font-semibold ${
-                              selected ? "bg-rose-400/20 text-rose-100" : "bg-rose-50 text-rose-700"
-                            }`}
-                          >
-                            {overdueCount}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className={`mt-3 h-1.5 rounded-full ${selected ? "bg-white/15" : "bg-neutral-200"}`}>
-                      <div
-                        className={`h-1.5 rounded-full ${selected ? "bg-white" : "bg-slate-900"}`}
-                        style={{ width: `${progress.percent}%` }}
-                      />
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </aside>
-
-        <main className="relative z-0 min-w-0 flex-1">
-          {selectedProject ? (
-            <>
-              <section className="mb-4 rounded-[26px] border border-neutral-200 bg-white px-5 py-4">
-                <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-                  <div className="min-w-0 flex-1">
-                    <div className="mb-2 text-[11px] uppercase tracking-[0.22em] text-neutral-500">Selected Project</div>
-
-                    <div className="flex flex-wrap items-center gap-2">
-                      <h1 className="text-[34px] font-black tracking-[-0.05em]">{selectedProject.code}</h1>
-                      <span className={`rounded-full border px-3 py-1.5 text-[11px] font-semibold ${badgeStyle(selectedProject.status)}`}>
-                        {selectedProject.status}
-                      </span>
-                      <span className={`rounded-md px-3 py-1.5 text-[11px] font-semibold ${itemPillStyle(selectedProject.item)}`}>
-                        {selectedProject.item}
-                      </span>
-                    </div>
-
-                    <div className="mt-3 grid grid-cols-2 gap-2 xl:grid-cols-5">
-                      <div className="rounded-xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2.5">
-                        <div className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">Country</div>
-                        <div className="mt-1 text-[14px] font-semibold">{selectedProject.country || "-"}</div>
-                      </div>
-
-                      <div className="rounded-xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2.5">
-                        <div className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">Exporter</div>
-                        <div className="mt-1 text-[14px] font-semibold">{selectedProject.exporter || "-"}</div>
-                      </div>
-
-                      <div className="rounded-xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2.5">
-                        <div className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">Client</div>
-                        <div className="mt-1 text-[14px] font-semibold">{selectedProject.client || "-"}</div>
-                      </div>
-
-                      <div className="rounded-xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2.5">
-                        <div className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">Progress</div>
-                        <div className="mt-1 text-[14px] font-semibold">{selectedProgress.percent}%</div>
-                      </div>
-
-                      <div className="rounded-xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2.5">
-                        <div className="text-[10px] uppercase tracking-[0.18em] text-neutral-500">Last Updated</div>
-                        <div className="mt-1 text-[14px] font-semibold">{selectedProject.lastChangedAt}</div>
-                      </div>
-                    </div>
-
-                    <div className="mt-3 rounded-[18px] border border-dashed border-neutral-200 bg-[#faf9f7] px-4 py-3 text-[14px] text-neutral-600">
-                      {selectedProject.note || "NOTE 비어있음"}
-                    </div>
-                  </div>
-
-                  <div className="w-full xl:w-[220px]">
-                    <div className="grid grid-cols-1 gap-2">
-                      <button
-                        onClick={() => openEditPanel(selectedProject)}
-                        className="rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm font-medium"
-                      >
-                        Edit Project
-                      </button>
-
-                      <button
-                        onClick={deleteSelectedProject}
-                        className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-700"
-                      >
-                        Delete Project
-                      </button>
-                    </div>
-                  </div>
-                </div>
+                ) : null}
               </section>
-
-              <div className="grid grid-cols-1 gap-4 2xl:grid-cols-[minmax(0,1fr)_340px]">
-                <div className="min-w-0">
-                  <section className="mb-4 grid grid-cols-1 gap-4 xl:grid-cols-3">
-                    <div className="rounded-[22px] border border-neutral-200 bg-white p-4">
-                      <div className="text-[11px] uppercase tracking-[0.18em] text-neutral-500">Progress</div>
-                      <div className="mt-2 text-[26px] font-black">
-                        {selectedProgress.done}/{selectedProgress.total}
-                      </div>
-                      <div className="mt-3 h-2.5 rounded-full bg-neutral-200">
-                        <div className="h-2.5 rounded-full bg-slate-900" style={{ width: `${selectedProgress.percent}%` }} />
-                      </div>
-                    </div>
-
-                    <div className="rounded-[22px] border border-neutral-200 bg-white p-4">
-                      <div className="text-[11px] uppercase tracking-[0.18em] text-neutral-500">Next Due</div>
-                      {selectedNextDue ? (
-                        <>
-                          <div className="mt-2 text-[15px] font-bold">{selectedNextDue.label}</div>
-                          <div className="mt-1 text-sm text-neutral-500">{selectedNextDue.dueDate.replace("T", " ")}</div>
-                          <div className="mt-1 text-xs text-neutral-400">{selectedNextDue.phaseTitle}</div>
-                        </>
-                      ) : (
-                        <div className="mt-2 text-sm text-neutral-500">No due scheduled</div>
-                      )}
-                    </div>
-
-                    <div className="rounded-[22px] border border-neutral-200 bg-white p-4">
-                      <div className="text-[11px] uppercase tracking-[0.18em] text-neutral-500">Overdue</div>
-                      <div className={`mt-2 text-[26px] font-black ${selectedOverdueCount > 0 ? "text-rose-600" : "text-neutral-900"}`}>
-                        {selectedOverdueCount}
-                      </div>
-                      <div className="mt-1 text-sm text-neutral-500">unchecked steps</div>
-                    </div>
-                  </section>
-
-                  <section className="rounded-[26px] border border-neutral-200 bg-white p-5">
-                    <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-                      <div>
-                        <div className="mb-1 text-[11px] uppercase tracking-[0.22em] text-neutral-500">Flowchart</div>
-                        <h2 className="text-[22px] font-bold tracking-[-0.03em]">15-Step Checklist</h2>
-                      </div>
-                      <button
-                        type="button"
-                        disabled={dueReminderBusy}
-                        onClick={() => {
-                          void runDueReminderScan();
-                        }}
-                        className="shrink-0 rounded-xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2 text-xs font-medium text-neutral-700 disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {dueReminderBusy ? "Due 알림 검사 중…" : "Due 24h 알림 검사 (API)"}
-                      </button>
-                    </div>
-
-                    <div className="space-y-3">
-                      {selectedProject.phases.map((phase) => {
-                        const doneCount = phase.steps.filter((step) => step.checked).length;
-                        const phaseOverdueCount = getPhaseOverdueCount(phase);
-
-                        return (
-                          <div key={phase.id} className="overflow-hidden rounded-[22px] border border-neutral-200">
-                            <button
-                              onClick={() => togglePhase(selectedProject.id, phase.id)}
-                              className="flex w-full items-start justify-between gap-4 border-b border-neutral-200 bg-[#f8f7f5] px-4 py-4 text-left"
-                            >
-                              <div className="min-w-0 flex-1">
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <div className="text-[18px] font-bold tracking-[-0.02em]">{phase.title}</div>
-                                  {phaseOverdueCount > 0 && (
-                                    <span className="rounded-full bg-rose-50 px-2 py-1 text-[11px] font-semibold text-rose-700">
-                                      {phaseOverdueCount} overdue
-                                    </span>
-                                  )}
-                                </div>
-
-                                <div className="mt-1 text-xs text-neutral-500">
-                                  {doneCount}/{phase.steps.length} done
-                                </div>
-
-                                {!phase.expanded && (
-                                  <div className="mt-2 text-sm leading-6 text-neutral-500">
-                                    {phase.steps.map((step) => step.label).join(" · ")}
-                                  </div>
-                                )}
-                              </div>
-
-                              <div className="pt-1 text-xl text-neutral-500">{phase.expanded ? "−" : "+"}</div>
-                            </button>
-
-                            {phase.expanded && (
-                              <div className="space-y-4 px-4 py-4">
-                                {phase.steps.map((step) => {
-                                  const overdue = !step.checked && !!step.dueDate && isOverdue(step.dueDate);
-                                  const assigneeMember = globalMembers.find((m) => m.id === step.assigneeMemberId);
-                                  const commentDraft = commentDrafts[step.id] ?? "";
-                                  const mentionQuery = extractMentionQuery(commentDraft);
-                                  const mentionCandidates =
-                                    mentionQuery !== null
-                                      ? globalMembers.filter(
-                                          (member) =>
-                                            member.name.toLowerCase().includes(mentionQuery.toLowerCase()) ||
-                                            member.email.toLowerCase().includes(mentionQuery.toLowerCase())
-                                        )
-                                      : [];
-
-                                  return (
-                                    <div key={step.id} className="rounded-[20px] border border-neutral-200 bg-white px-4 py-4">
-                                      <div className="flex items-start gap-3">
-                                        <input
-                                          type="checkbox"
-                                          checked={step.checked}
-                                          onChange={(e) =>
-                                            toggleStepChecked(selectedProject.id, phase.id, step.id, e.target.checked)
-                                          }
-                                          className="mt-1 h-4 w-4 shrink-0 accent-blue-600"
-                                        />
-
-                                        <div className="min-w-0 flex-1">
-                                          <div className="text-[16px] font-medium text-neutral-900">{step.label}</div>
-
-                                          {overdue && (
-                                            <div className="mt-2 inline-flex rounded-full border border-rose-200 bg-rose-50 px-2 py-1 text-[11px] font-medium text-rose-700">
-                                              OVERDUE
-                                            </div>
-                                          )}
-
-                                          <div className="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-[240px_240px_minmax(0,1fr)_110px]">
-                                            <div className="rounded-xl border border-[#c8d5ff] bg-[#f5f8ff] px-3 py-2.5">
-                                              <div className="mb-1 text-[10px] uppercase tracking-[0.14em] text-neutral-500">
-                                                Due Date
-                                              </div>
-                                              <Input
-                                                type="datetime-local"
-                                                value={step.dueDate}
-                                                onChange={(v) =>
-                                                  updateStep(selectedProject.id, phase.id, step.id, { dueDate: v })
-                                                }
-                                              />
-                                            </div>
-
-                                            <div className="rounded-xl border border-neutral-200 bg-white px-3 py-2.5">
-                                              <div className="mb-1 text-[10px] uppercase tracking-[0.14em] text-neutral-500">
-                                                Confirmed At
-                                              </div>
-                                              <Input
-                                                type="datetime-local"
-                                                value={step.confirmedAt}
-                                                onChange={(v) =>
-                                                  updateStep(selectedProject.id, phase.id, step.id, { confirmedAt: v })
-                                                }
-                                              />
-                                            </div>
-
-                                            <div className="rounded-xl border border-[#c8d5ff] bg-[#f5f8ff] px-3 py-2.5">
-                                              <div className="mb-1 text-[10px] uppercase tracking-[0.14em] text-neutral-500">
-                                                Remark
-                                              </div>
-                                              <Input
-                                                value={step.memo}
-                                                onChange={(v) =>
-                                                  updateStep(selectedProject.id, phase.id, step.id, { memo: v })
-                                                }
-                                                placeholder="마감 메모"
-                                              />
-                                            </div>
-
-                                            <button
-                                              onClick={() =>
-                                                updateStep(selectedProject.id, phase.id, step.id, {
-                                                  dueDate: "",
-                                                  confirmedAt: "",
-                                                  memo: "",
-                                                  assigneeMemberId: "",
-                                                  dueReminderSentAt: "",
-                                                })
-                                              }
-                                              className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700"
-                                            >
-                                              초기화
-                                            </button>
-                                          </div>
-
-                                          <div className="mt-3 max-w-full xl:max-w-[320px]">
-                                            <div className="rounded-xl border border-[#c8d5ff] bg-[#f5f8ff] px-3 py-2.5">
-                                              <div className="mb-1 text-[10px] uppercase tracking-[0.14em] text-neutral-500">
-                                                Assignee
-                                              </div>
-                                              <select
-                                                value={assigneeMember ? step.assigneeMemberId : ""}
-                                                onChange={(e) =>
-                                                  updateStep(selectedProject.id, phase.id, step.id, {
-                                                    assigneeMemberId: e.target.value,
-                                                  })
-                                                }
-                                                className="w-full cursor-pointer bg-transparent text-[14px] text-neutral-900 outline-none"
-                                              >
-                                                <option value="">미지정</option>
-                                                {globalMembers.map((member) => (
-                                                  <option key={member.id} value={member.id}>
-                                                    {member.name}
-                                                  </option>
-                                                ))}
-                                              </select>
-                                              {assigneeMember ? (
-                                                <div className="mt-1.5 truncate text-[11px] text-neutral-500">
-                                                  {assigneeMember.email}
-                                                </div>
-                                              ) : null}
-                                            </div>
-                                          </div>
-
-                                          <div className="mt-4 rounded-2xl border border-neutral-200 bg-[#faf9f7] p-3">
-                                            <div className="mb-2 flex items-center justify-between">
-                                              <div className="text-[11px] uppercase tracking-[0.14em] text-neutral-500">
-                                                Comments / Mentions
-                                              </div>
-                                              <button
-                                                onClick={() => toggleCommentOpen(step.id)}
-                                                className="rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium"
-                                              >
-                                                {commentOpenMap[step.id] ? "Hide" : "Open"}
-                                              </button>
-                                            </div>
-
-                                            {commentOpenMap[step.id] && (
-                                              <div className="relative">
-                                                <div className="rounded-xl border border-neutral-200 bg-white px-3 py-2">
-                                                  <textarea
-                                                    value={commentDraft}
-                                                    onChange={(e) => setCommentDraft(step.id, e.target.value)}
-                                                    placeholder="@김성경 확인 부탁 / @name 으로 멘션"
-                                                    className="min-h-[88px] w-full resize-none bg-transparent text-sm outline-none placeholder:text-neutral-400"
-                                                  />
-                                                </div>
-
-                                                {mentionQuery !== null && mentionCandidates.length > 0 && (
-                                                  <div className="absolute left-0 top-full z-10 mt-2 w-full rounded-2xl border border-neutral-200 bg-white p-2 shadow-lg">
-                                                    {mentionCandidates.map((member) => (
-                                                      <button
-                                                        key={member.id}
-                                                        onClick={() => applyMention(step.id, member)}
-                                                        className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left hover:bg-neutral-50"
-                                                      >
-                                                        <MemberInitial name={member.name} />
-                                                        <div className="min-w-0">
-                                                          <div className="truncate text-sm font-medium">{member.name}</div>
-                                                          <div className="truncate text-xs text-neutral-500">{member.email}</div>
-                                                        </div>
-                                                      </button>
-                                                    ))}
-                                                  </div>
-                                                )}
-
-                                                <div className="mt-2 flex justify-end">
-                                                  <button
-                                                    type="button"
-                                                    disabled={savingCommentStepId === step.id}
-                                                    onClick={() => {
-                                                      void addCommentWithMentions(selectedProject.id, phase.id, step.id);
-                                                    }}
-                                                    className="rounded-xl border border-slate-900 bg-slate-900 px-3 py-2 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
-                                                  >
-                                                    {savingCommentStepId === step.id ? "저장 중…" : "Save Comment"}
-                                                  </button>
-                                                </div>
-                                              </div>
-                                            )}
-
-                                            <div className="mt-3 space-y-2">
-                                              {step.comments.length === 0 ? (
-                                                <div className="text-sm text-neutral-400">아직 댓글이 없습니다.</div>
-                                              ) : (
-                                                step.comments.map((comment) => (
-                                                  <div
-                                                    key={comment.id}
-                                                    className="rounded-xl border border-neutral-200 bg-white px-3 py-3"
-                                                  >
-                                                    <div className="flex items-center justify-between gap-3">
-                                                      <div className="text-sm font-semibold">{comment.authorName}</div>
-                                                      <div className="text-xs text-neutral-400">{comment.createdAt}</div>
-                                                    </div>
-                                                    <div className="mt-2 text-sm leading-6 text-neutral-700">
-                                                      {renderMentions(comment.message, comment.mentions)}
-                                                    </div>
-                                                  </div>
-                                                ))
-                                              )}
-                                            </div>
-                                          </div>
-                                        </div>
-                                      </div>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </section>
-                </div>
-
-                <aside className="space-y-4 2xl:sticky 2xl:top-4 2xl:self-start">
-                  <section className="rounded-[26px] border border-neutral-200 bg-white p-4">
-                    <div className="mb-3">
-                      <div className="mb-1 text-[11px] uppercase tracking-[0.22em] text-neutral-500">Update Log</div>
-                      <h2 className="text-[20px] font-bold tracking-[-0.03em]">Email Log</h2>
-                    </div>
-
-                    <div className="space-y-3">
-                      {selectedProject.notificationLogs.length === 0 ? (
-                        <div className="rounded-2xl border border-dashed border-neutral-200 bg-[#faf9f7] px-4 py-6 text-center text-sm text-neutral-400">
-                          아직 이메일 알림 로그가 없습니다.
-                        </div>
-                      ) : (
-                        selectedProject.notificationLogs.map((log) => (
-                          <div key={log.id} className="rounded-2xl border border-neutral-200 bg-[#faf9f7] px-3 py-3">
-                            <div className="text-sm font-semibold">{log.stepLabel}</div>
-                            <div className="mt-1 text-xs text-neutral-500">{log.phaseTitle}</div>
-                            <div className="mt-2 text-xs text-neutral-600">
-                              {log.kind === "due_reminder" ? (
-                                <>
-                                  <span className="font-medium">{log.authorName}</span>
-                                  {log.recipients.length > 0
-                                    ? ` → ${log.recipients.map((r) => `${r.name} (${r.email})`).join(", ")}`
-                                    : null}
-                                </>
-                              ) : (
-                                <>
-                                  <span className="font-medium">{log.authorName}</span> mentioned{" "}
-                                  {log.recipients.map((r) => `@${r.name}`).join(", ")}
-                                </>
-                              )}
-                            </div>
-                            <div className="mt-2 text-sm text-neutral-700">{log.commentText}</div>
-                            <div className="mt-2 text-xs text-neutral-400">{log.createdAt}</div>
-                            {log.emailNotify && (
-                              <div className="mt-2 border-t border-neutral-200 pt-2 text-[11px] leading-relaxed text-neutral-600">
-                                <div
-                                  className={
-                                    log.emailNotify.overallOk ? "font-medium text-emerald-700" : "font-medium text-rose-700"
-                                  }
-                                >
-                                  이메일:{" "}
-                                  {log.emailNotify.mock ? "[MOCK] " : ""}
-                                  {log.emailNotify.overallOk ? "발송 성공" : "발송 실패"}
-                                  {log.emailNotify.attemptedAt ? ` · ${log.emailNotify.attemptedAt}` : ""}
-                                </div>
-                                {log.emailNotify.overallError ? (
-                                  <div className="mt-1 text-rose-600">{log.emailNotify.overallError}</div>
-                                ) : null}
-                                {log.emailNotify.perRecipient.some((r) => !r.ok) ? (
-                                  <ul className="mt-1 list-inside list-disc text-neutral-500">
-                                    {log.emailNotify.perRecipient
-                                      .filter((r) => !r.ok)
-                                      .map((r) => (
-                                        <li key={r.email}>
-                                          {r.name} ({r.email}){r.error ? ` — ${r.error}` : ""}
-                                        </li>
-                                      ))}
-                                  </ul>
-                                ) : null}
-                              </div>
-                            )}
-                          </div>
-                        ))
-                      )}
-                    </div>
-                  </section>
-                </aside>
+            </section>
               </div>
-            </>
-          ) : (
-            <div className="rounded-[26px] border border-neutral-200 bg-white px-6 py-16 text-center">
-              <div className="text-[22px] font-bold">프로젝트가 없습니다.</div>
-              <div className="mt-2 text-sm text-neutral-500">왼쪽에서 New Project로 시작하면 됩니다.</div>
-            </div>
-          )}
-        </main>
-      </div>
+            ) : (
+              <div className="flex min-h-[280px] items-center justify-center px-6">
+                <div className="rounded-[28px] border border-dashed border-neutral-200 bg-white px-8 py-12 text-center text-sm text-neutral-500">
+                  선택된 프로젝트가 없습니다. 왼쪽 목록에서 프로젝트를 선택하거나 NEW로 추가하세요.
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </main>
     </div>
   );
 }

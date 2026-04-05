@@ -46,6 +46,8 @@ export async function sendFlowchartEmail(options: {
   to: string;
   subject: string;
   text: string;
+  /** Resend HTML 본문(멀티파트). 없으면 text만 전송 */
+  html?: string;
   kind: FlowchartEmailKind;
 }): Promise<SendFlowchartEmailResult> {
   const { intendedTo, deliveryTo } = resolveEmailDelivery(options.to);
@@ -61,6 +63,9 @@ export async function sendFlowchartEmail(options: {
     console.log("  from:", process.env.EMAIL_FROM?.trim() ?? "(EMAIL_FROM - mock에서는 미사용)");
     console.log("  subject:", subjectForSend(options.subject));
     console.log("  body:\n" + options.text);
+    if (options.html?.trim()) {
+      console.log("  html body:\n" + options.html);
+    }
     return { ok: true, mock: true };
   }
 
@@ -90,6 +95,7 @@ export async function sendFlowchartEmail(options: {
         to: [deliveryTo],
         subject: subjectForSend(options.subject),
         text: options.text,
+        ...(options.html?.trim() ? { html: options.html.trim() } : {}),
       }),
     });
 

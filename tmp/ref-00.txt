@@ -1,0 +1,409 @@
+     1|"use client";
+     2|
+     3|import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+     4|
+     5|import {
+     6|  buildDueReminderProcessRequest,
+     7|  type DueReminderJobResult,
+     8|  type DueReminderProcessResponse,
+     9|} from "@/lib/due-reminder-email";
+    10|import { buildFlowchartStepLink } from "@/lib/flowchart-step-link";
+    11|import { type MentionNotifyResponse } from "@/lib/mention-email";
+    12|import type { RealtimeChannel } from "@supabase/supabase-js";
+    13|
+    14|import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+    15|import { FLOWCHART_LEGACY_STORAGE_KEY, getFlowchartShareId, isSupabaseDashboardEnabled } from "@/lib/sync/constants";
+    16|import { deleteBoardMemberAsAdmin } from "@/app/actions/delete-board-member";
+    17|import { ensureBoardMemberForCurrentUser } from "@/app/actions/ensure-board-member";
+    18|import { touchBoardMemberHeartbeat } from "@/app/actions/heartbeat-board-member";
+    19|import { isBoardAdminEmail } from "@/lib/board-admin";
+    20|import { isMemberOnline } from "@/lib/members-online";
+    21|import {
+    22|  loadMembersOnly,
+    23|  loadProjectsOnly,
+    24|  rowToProject,
+    25|  syncProjectsOnly,
+    26|  type MemberRow,
+    27|  type ProjectRow,
+    28|} from "@/lib/sync/dashboard";
+    29|import { CreatableSelect } from "@/components/project-dashboard/CreatableSelect";
+    30|import { OptionManageModal } from "@/components/project-dashboard/OptionManageModal";
+    31|import {
+    32|  addOptionToList,
+    33|  applyProjectFilters,
+    34|  countOptionUsage,
+    35|  defaultProjectFilters,
+    36|  emptySelectOptions,
+    37|  mergeSelectOptionsWithProjects,
+    38|  removeOptionFromList,
+    39|  type ProjectFilters,
+    40|  type SelectOptionFieldKey,
+    41|  type SelectOptions,
+    42|} from "@/lib/project-dashboard-core";
+    43|
+    44|type ProjectStatus = "REVIEW" | "IN PROGRESS" | "HOLD" | "DONE" | "DRAFT";
+    45|
+    46|type OverviewSortOption = "CODE_ASC" | "CODE_DESC" | "UPDATED_DESC" | "PROGRESS_DESC";
+    47|type MemberRole = "관리자" | "사용자";
+    48|
+    49|type Member = {
+    50|  id: string;
+    51|  name: string;
+    52|  email: string;
+    53|  role: MemberRole;
+    54|  /** Supabase Auth 사용자 id */
+    55|  userId?: string | null;
+    56|  /** members.last_seen_at (DB 동기화 시) */
+    57|  lastSeenAt?: string | null;
+    58|};
+    59|
+    60|function mapMemberRowToPageMember(row: MemberRow): Member {
+    61|  const role: MemberRole = row.role === "관리자" ? "관리자" : "사용자";
+    62|  const m: Member = {
+    63|    id: row.id,
+    64|    name: row.name,
+    65|    email: row.email,
+    66|    role,
+    67|    lastSeenAt: row.last_seen_at ?? null,
+    68|  };
+    69|  if (row.user_id != null) {
+    70|    m.userId = row.user_id;
+    71|  }
+    72|  return m;
+    73|}
+    74|
+    75|type Mention = {
+    76|  memberId: string;
+    77|  name: string;
+    78|  email: string;
+    79|};
+    80|
+    81|type StepComment = {
+    82|  id: string;
+    83|  authorName: string;
+    84|  message: string;
+    85|  mentions: Mention[];
+    86|  createdAt: string;
+    87|};
+    88|
+    89|type NotificationLogEmailRecipient = {
+    90|  email: string;
+    91|  name: string;
+    92|  ok: boolean;
+    93|  error?: string;
+    94|};
+    95|
+    96|type NotificationLog = {
+    97|  id: string;
+    98|  /** 생략 시 멘션 로그(기존 데이터 호환) */
+    99|  kind?: "mention" | "due_reminder";
+   100|  projectCode: string;
+   101|  phaseTitle: string;
+   102|  stepLabel: string;
+   103|  authorName: string;
+   104|  commentText: string;
+   105|  /** 대시보드 해당 스텝 딥링크 (?project=&step=) */
+   106|  stepLink?: string;
+   107|  recipients: Mention[];
+   108|  createdAt: string;
+   109|  /** 멘션 메일 발송 시도 결과 (멘션이 없으면 생략) */
+   110|  emailNotify?: {
+   111|    attemptedAt: string;
+   112|    mock: boolean;
+   113|    overallOk: boolean;
+   114|    overallError?: string;
+   115|    perRecipient: NotificationLogEmailRecipient[];
+   116|  };
+   117|};
+   118|
+   119|type Step = {
+   120|  id: string;
+   121|  label: string;
+   122|  checked: boolean;
+   123|  /** 해당 없음 → 자동 완료(checked) 처리 */
+   124|  notApplicable: boolean;
+   125|  dueDate: string;
+   126|  /** 마감 24시간 전 알림 발송 시각(ISO). 비어 있으면 미발송 */
+   127|  dueReminderSentAt: string;
+   128|  confirmedAt: string;
+   129|  memo: string;
+   130|  assigneeMemberIds: string[];
+   131|  comments: StepComment[];
+   132|};
+   133|
+   134|type StepEditorDraft = {
+   135|  dueDate: string;
+   136|  confirmedAt: string;
+   137|  memo: string;
+   138|  assigneeMemberIds: string[];
+   139|};
+   140|
+   141|type Phase = {
+   142|  id: string;
+   143|  title: string;
+   144|  expanded: boolean;
+   145|  steps: Step[];
+   146|};
+   147|
+   148|type Project = {
+   149|  id: string;
+   150|  code: string;
+   151|  status: ProjectStatus;
+   152|  country: string;
+   153|  exporter: string;
+   154|  item: string;
+   155|  client: string;
+   156|  businessModel: string;
+   157|  incoterms: string;
+   158|  hsCode: string;
+   159|  dutyRate: string;
+   160|  vatRate: string;
+   161|  note: string;
+   162|  updated: boolean;
+   163|  lastChangedAt: string;
+   164|  phases: Phase[];
+   165|  notificationLogs: NotificationLog[];
+   166|};
+   167|
+   168|type ProjectHeaderDraft = {
+   169|  code: string;
+   170|  status: ProjectStatus;
+   171|  country: string;
+   172|  businessModel: string;
+   173|  incoterms: string;
+   174|  exporter: string;
+   175|  client: string;
+   176|  item: string;
+   177|  hsCode: string;
+   178|  dutyRate: string;
+   179|  vatRate: string;
+   180|};
+   181|
+   182|type PersistedState = {
+   183|  projects: Project[];
+   184|  selectedId: string;
+   185|  globalMembers: Member[];
+   186|  sidebarFilters?: ProjectFilters;
+   187|  detailFilters?: ProjectFilters;
+   188|  sidebarSearch?: string;
+   189|  detailSearch?: string;
+   190|  /** @deprecated 호환용 — 없으면 무시 */
+   191|  projectFilters?: ProjectFilters;
+   192|  selectOptions?: SelectOptions;
+   193|};
+   194|
+   195|function parsePersistedJson(raw: string): Partial<PersistedState> | null {
+   196|  try {
+   197|    const v = JSON.parse(raw) as unknown;
+   198|    if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+   199|    return v as Partial<PersistedState>;
+   200|  } catch {
+   201|    return null;
+   202|  }
+   203|}
+   204|
+   205|function normalizeStoredMembers(raw: unknown): Member[] {
+   206|  if (!Array.isArray(raw)) return [];
+   207|  const out: Member[] = [];
+   208|  for (const m of raw) {
+   209|    if (!m || typeof m !== "object") continue;
+   210|    const o = m as Record<string, unknown>;
+   211|    if (typeof o.id !== "string") continue;
+   212|    const roleRaw = o.role;
+   213|    const role: MemberRole =
+   214|      roleRaw === "관리자" ? "관리자" : roleRaw === "사용자" ? "사용자" : "사용자";
+   215|
+   216|    const name = typeof o.name === "string" ? o.name : o.name == null ? "" : String(o.name);
+   217|    const email = typeof o.email === "string" ? o.email : o.email == null ? "" : String(o.email);
+   218|
+   219|    let normalizedUserId: string | null | undefined;
+   220|    if (!Object.prototype.hasOwnProperty.call(o, "userId") && !Object.prototype.hasOwnProperty.call(o, "user_id")) {
+   221|      normalizedUserId = undefined;
+   222|    } else {
+   223|      const rawUid = Object.prototype.hasOwnProperty.call(o, "userId") ? o.userId : o.user_id;
+   224|      if (rawUid === undefined) {
+   225|        normalizedUserId = undefined;
+   226|      } else if (rawUid === null) {
+   227|        normalizedUserId = null;
+   228|      } else if (typeof rawUid === "string") {
+   229|        normalizedUserId = rawUid.length > 0 ? rawUid : null;
+   230|      } else {
+   231|        normalizedUserId = null;
+   232|      }
+   233|    }
+   234|
+   235|    const member: Member = {
+   236|      id: o.id,
+   237|      name,
+   238|      email,
+   239|      role,
+   240|    };
+   241|    if (normalizedUserId !== undefined) {
+   242|      member.userId = normalizedUserId;
+   243|    }
+   244|    out.push(member);
+   245|  }
+   246|  return out;
+   247|}
+   248|
+   249|function normalizeStoredProjects(raw: unknown): Project[] {
+   250|  if (!Array.isArray(raw)) return [];
+   251|  const out: Project[] = [];
+   252|  for (const item of raw) {
+   253|    try {
+   254|      out.push(projectFromStorage(item));
+   255|    } catch {
+   256|      // 손상된 프로젝트 한 건은 건너뜀
+   257|    }
+   258|  }
+   259|  return out;
+   260|}
+   261|
+   262|function createId(prefix = "id") {
+   263|  return `${prefix}-${Math.random().toString(36).slice(2, 10)}-${Date.now()}`;
+   264|}
+   265|
+   266|function nowString() {
+   267|  const d = new Date();
+   268|  const yyyy = d.getFullYear();
+   269|  const mm = String(d.getMonth() + 1).padStart(2, "0");
+   270|  const dd = String(d.getDate()).padStart(2, "0");
+   271|  const hh = String(d.getHours()).padStart(2, "0");
+   272|  const min = String(d.getMinutes()).padStart(2, "0");
+   273|  return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
+   274|}
+   275|
+   276|function todayLocalDate() {
+   277|  const d = new Date();
+   278|  const yyyy = d.getFullYear();
+   279|  const mm = String(d.getMonth() + 1).padStart(2, "0");
+   280|  const dd = String(d.getDate()).padStart(2, "0");
+   281|  return `${yyyy}-${mm}-${dd}`;
+   282|}
+   283|
+   284|function parseLocalDate(value: string) {
+   285|  if (!value) return null;
+   286|  const m = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+   287|  if (!m) return null;
+   288|  const y = Number(m[1]);
+   289|  const mo = Number(m[2]) - 1;
+   290|  const day = Number(m[3]);
+   291|  const date = new Date(y, mo, day);
+   292|  if (Number.isNaN(date.getTime())) return null;
+   293|  return date;
+   294|}
+   295|
+   296|function endOfLocalDay(date: Date) {
+   297|  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59, 999);
+   298|}
+   299|
+   300|function isOverdue(value: string) {
+   301|  const d = parseLocalDate(value);
+   302|  if (!d) return false;
+   303|  return endOfLocalDay(d).getTime() < Date.now();
+   304|}
+   305|
+   306|function normalizeDateOnly(value: string) {
+   307|  if (!value) return "";
+   308|  const m = value.match(/^(\d{4}-\d{2}-\d{2})/);
+   309|  return m ? m[1]! : "";
+   310|}
+   311|
+   312|function stepToDraft(step: Step): StepEditorDraft {
+   313|  return {
+   314|    dueDate: step.dueDate,
+   315|    confirmedAt: step.confirmedAt,
+   316|    memo: step.memo,
+   317|    assigneeMemberIds: [...step.assigneeMemberIds],
+   318|  };
+   319|}
+   320|
+   321|function idSetsEqual(a: string[], b: string[]) {
+   322|  if (a.length !== b.length) return false;
+   323|  const sa = [...a].sort();
+   324|  const sb = [...b].sort();
+   325|  return sa.every((v, i) => v === sb[i]);
+   326|}
+   327|
+   328|function extractMentionsFromText(text: string, members: Member[]): Mention[] {
+   329|  return members
+   330|    .filter((member) => text.includes(`@${member.name}`))
+   331|    .map((member) => ({
+   332|      memberId: member.id,
+   333|      name: member.name,
+   334|      email: member.email,
+   335|    }));
+   336|}
+   337|
+   338|function buildNotificationRecipients(memo: string, assigneeMemberIds: string[], members: Member[]): Mention[] {
+   339|  const mentionRecipients = extractMentionsFromText(memo, members);
+   340|  const assigneeRecipients = assigneeMemberIds
+   341|    .map((id) => members.find((m) => m.id === id))
+   342|    .filter((m): m is Member => Boolean(m))
+   343|    .map((m) => ({
+   344|      memberId: m.id,
+   345|      name: m.name,
+   346|      email: m.email,
+   347|    }));
+   348|
+   349|  const merged = [...mentionRecipients, ...assigneeRecipients];
+   350|  const seen = new Set<string>();
+   351|  return merged.filter((r) => {
+   352|    const key = (r.memberId || r.email || "").trim().toLowerCase();
+   353|    if (!key || seen.has(key)) return false;
+   354|    seen.add(key);
+   355|    return true;
+   356|  });
+   357|}
+   358|
+   359|function buildAssigneeSummary(members: Member[], ids: string[]): string {
+   360|  if (!ids.length) return "미지정";
+   361|  const names = ids
+   362|    .map((id) => members.find((m) => m.id === id)?.name)
+   363|    .filter((n): n is string => Boolean(n?.trim()));
+   364|  if (!names.length) return "미지정";
+   365|  if (names.length === 1) return names[0]!;
+   366|  return `${names[0]!} 외 ${names.length - 1}명`;
+   367|}
+   368|
+   369|function createStep(label: string): Step {
+   370|  return {
+   371|    id: createId("step"),
+   372|    label,
+   373|    checked: false,
+   374|    notApplicable: false,
+   375|    dueDate: "",
+   376|    dueReminderSentAt: "",
+   377|    confirmedAt: "",
+   378|    memo: "",
+   379|    assigneeMemberIds: [],
+   380|    comments: [],
+   381|  };
+   382|}
+   383|
+   384|function createPhase(title: string, stepLabels: string[], expanded = false): Phase {
+   385|  return {
+   386|    id: createId("phase"),
+   387|    title,
+   388|    expanded,
+   389|    steps: stepLabels.map((label) => createStep(label)),
+   390|  };
+   391|}
+   392|
+   393|function createFixedFlowchartPhases(): Phase[] {
+   394|  return [
+   395|    createPhase("PHASE 1 — Planning", ["Business Model Check", "Import Availability", "Pricing"]),
+   396|    createPhase("PHASE 2 — Ordering", ["Overseas Order", "PSS Test", "Packing & Label"]),
+   397|    createPhase("PHASE 3 — Shipping", ["Booking", "Shipping Document", "Payment"]),
+   398|    createPhase("PHASE 4 — Clearance", [
+   399|      "Arrival",
+   400|      "Inspection / Inland Transport",
+   401|      "Customs Clearance",
+   402|    ]),
+   403|    createPhase("PHASE 5 — Closing", [
+   404|      "Warehousing",
+   405|      "Settlement",
+   406|      "Feedback / Next Order Plan",
+   407|    ]),
+   408|  ];
+   409|}

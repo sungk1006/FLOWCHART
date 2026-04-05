@@ -1,0 +1,2823 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import {
+  buildDueReminderProcessRequest,
+  type DueReminderJobResult,
+  type DueReminderProcessResponse,
+  type DueReminderSentMap,
+  getDueSoonLabel,
+  isDueDateOverdue,
+  normalizeDueReminderSentMapFromWire,
+  offsetToLabel,
+} from "@/lib/due-reminder-email";
+import { type MentionNotifyResponse } from "@/lib/mention-email";
+import type { RealtimeChannel } from "@supabase/supabase-js";
+
+import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import { FLOWCHART_LEGACY_STORAGE_KEY, getFlowchartShareId, isSupabaseDashboardEnabled } from "@/lib/sync/constants";
+import { deleteBoardMemberAsAdmin } from "@/app/actions/delete-board-member";
+import { ensureBoardMemberForCurrentUser } from "@/app/actions/ensure-board-member";
+import { touchBoardMemberHeartbeat } from "@/app/actions/heartbeat-board-member";
+import { isBoardAdminEmail } from "@/lib/board-admin";
+import { isMemberOnline } from "@/lib/members-online";
+import {
+  loadMembersOnly,
+  loadProjectsOnly,
+  rowToProject,
+  syncProjectsOnly,
+  type MemberRow,
+  type ProjectRow,
+} from "@/lib/sync/dashboard";
+
+type ProjectStatus = "REVIEW" | "IN PROGRESS" | "HOLD" | "DONE" | "DRAFT";
+type SortOption = "UPDATED_DESC" | "CODE_ASC" | "CODE_DESC" | "PROGRESS_DESC";
+type FormMode = "create" | "edit";
+type MemberRole = "관리자" | "사용자";
+
+type Member = {
+  id: string;
+  name: string;
+  email: string;
+  role: MemberRole;
+  /** Supabase Auth 사용자 id */
+  userId?: string | null;
+  /** members.last_seen_at (DB 동기화 시) */
+  lastSeenAt?: string | null;
+};
+
+function mapMemberRowToPageMember(row: MemberRow): Member {
+  const role: MemberRole = row.role === "관리자" ? "관리자" : "사용자";
+  const m: Member = {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    role,
+    lastSeenAt: row.last_seen_at ?? null,
+  };
+  if (row.user_id != null) {
+    m.userId = row.user_id;
+  }
+  return m;
+}
+
+type Mention = {
+  memberId: string;
+  name: string;
+  email: string;
+};
+
+type StepComment = {
+  id: string;
+  authorName: string;
+  message: string;
+  mentions: Mention[];
+  createdAt: string;
+};
+
+type NotificationLogEmailRecipient = {
+  email: string;
+  name: string;
+  ok: boolean;
+  error?: string;
+};
+
+type NotificationLog = {
+  id: string;
+  /** 생략 시 멘션 로그(기존 데이터 호환) */
+  kind?: "mention" | "due_reminder";
+  projectCode: string;
+  phaseTitle: string;
+  stepLabel: string;
+  authorName: string;
+  commentText: string;
+  recipients: Mention[];
+  createdAt: string;
+  /** 멘션 메일 발송 시도 결과 (멘션이 없으면 생략) */
+  emailNotify?: {
+    attemptedAt: string;
+    mock: boolean;
+    overallOk: boolean;
+    overallError?: string;
+    perRecipient: NotificationLogEmailRecipient[];
+  };
+};
+
+type Step = {
+  id: string;
+  label: string;
+  checked: boolean;
+  dueDate: string;
+  dueReminderSentMap: DueReminderSentMap;
+  confirmedAt: string;
+  memo: string;
+  assigneeMemberId: string;
+  comments: StepComment[];
+};
+
+type Phase = {
+  id: string;
+  title: string;
+  expanded: boolean;
+  steps: Step[];
+};
+
+type PriceCurrency = "USD" | "KRW";
+type PriceUnit = "KG" | "LB" | "UNIT";
+
+type Project = {
+  id: string;
+  code: string;
+  status: ProjectStatus;
+  country: string;
+  exporter: string;
+  item: string;
+  client: string;
+  businessModel: string;
+  incoterms: string;
+  hsCode: string;
+  customRate: string;
+  vatRate: string;
+  priceValue: string;
+  priceCurrency: PriceCurrency;
+  priceUnit: PriceUnit;
+  offerPriceValue: string;
+  offerPriceCurrency: PriceCurrency;
+  offerPriceUnit: PriceUnit;
+  finalPriceValue: string;
+  finalPriceCurrency: PriceCurrency;
+  finalPriceUnit: PriceUnit;
+  note: string;
+  updated: boolean;
+  lastChangedAt: string;
+  phases: Phase[];
+  notificationLogs: NotificationLog[];
+};
+
+type ProjectForm = {
+  code: string;
+  status: ProjectStatus;
+  country: string;
+  exporter: string;
+  item: string;
+  client: string;
+  businessModel: string;
+  incoterms: string;
+  hsCode: string;
+  customRate: string;
+  vatRate: string;
+  priceValue: string;
+  priceCurrency: PriceCurrency;
+  priceUnit: PriceUnit;
+  offerPriceValue: string;
+  offerPriceCurrency: PriceCurrency;
+  offerPriceUnit: PriceUnit;
+  finalPriceValue: string;
+  finalPriceCurrency: PriceCurrency;
+  finalPriceUnit: PriceUnit;
+  note: string;
+};
+
+type PersistedState = {
+  projects: Project[];
+  selectedId: string;
+  globalMembers: Member[];
+};
+
+function parsePersistedJson(raw: string): Partial<PersistedState> | null {
+  try {
+    const v = JSON.parse(raw) as unknown;
+    if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+    return v as Partial<PersistedState>;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeStoredMembers(raw: unknown): Member[] {
+  if (!Array.isArray(raw)) return [];
+  const out: Member[] = [];
+  for (const m of raw) {
+    if (!m || typeof m !== "object") continue;
+    const o = m as Record<string, unknown>;
+    if (typeof o.id !== "string") continue;
+    const roleRaw = o.role;
+    const role: MemberRole =
+      roleRaw === "관리자" ? "관리자" : roleRaw === "사용자" ? "사용자" : "사용자";
+
+    const name = typeof o.name === "string" ? o.name : o.name == null ? "" : String(o.name);
+    const email = typeof o.email === "string" ? o.email : o.email == null ? "" : String(o.email);
+
+    let normalizedUserId: string | null | undefined;
+    if (!Object.prototype.hasOwnProperty.call(o, "userId") && !Object.prototype.hasOwnProperty.call(o, "user_id")) {
+      normalizedUserId = undefined;
+    } else {
+      const rawUid = Object.prototype.hasOwnProperty.call(o, "userId") ? o.userId : o.user_id;
+      if (rawUid === undefined) {
+        normalizedUserId = undefined;
+      } else if (rawUid === null) {
+        normalizedUserId = null;
+      } else if (typeof rawUid === "string") {
+        normalizedUserId = rawUid.length > 0 ? rawUid : null;
+      } else {
+        normalizedUserId = null;
+      }
+    }
+
+    const member: Member = {
+      id: o.id,
+      name,
+      email,
+      role,
+    };
+    if (normalizedUserId !== undefined) {
+      member.userId = normalizedUserId;
+    }
+    out.push(member);
+  }
+  return out;
+}
+
+function normalizeStoredProjects(raw: unknown): Project[] {
+  if (!Array.isArray(raw)) return [];
+  const out: Project[] = [];
+  for (const item of raw) {
+    try {
+      out.push(projectFromStorage(item));
+    } catch {
+      // 손상된 프로젝트 한 건은 건너뜀
+    }
+  }
+  return out;
+}
+
+const ITEM_OPTIONS = [
+  "GREEN BEAN",
+  "INSTANT COFFEE",
+  "DECAF GREEN",
+  "TEA EXTRACT",
+  "TEMPLATE",
+  "OTHER",
+];
+
+function createId(prefix = "id") {
+  return `${prefix}-${Math.random().toString(36).slice(2, 10)}-${Date.now()}`;
+}
+
+function nowString() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const min = String(d.getMinutes()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
+}
+
+function toDatetimeLocal(date: Date) {
+  const offset = date.getTimezoneOffset();
+  const local = new Date(date.getTime() - offset * 60 * 1000);
+  return local.toISOString().slice(0, 16);
+}
+
+function isoNowLocal() {
+  return toDatetimeLocal(new Date());
+}
+
+function parseDateSafe(value: string) {
+  if (!value) return null;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+}
+
+function isOverdue(value: string) {
+  const d = parseDateSafe(value);
+  if (!d) return false;
+  return d.getTime() < Date.now();
+}
+
+/** 마감일 로컬 일 끝 기준 overdue (플로우 스텝용) */
+function isStepDueOverdue(dueDate: string): boolean {
+  if (!dueDate?.trim()) return false;
+  return isDueDateOverdue(dueDate, Date.now());
+}
+
+function normalizePriceCurrency(v: unknown): PriceCurrency {
+  return v === "KRW" ? "KRW" : "USD";
+}
+
+function normalizePriceUnit(v: unknown): PriceUnit {
+  if (v === "LB") return "LB";
+  if (v === "UNIT") return "UNIT";
+  return "KG";
+}
+
+function sanitizeRateDigits(raw: string): string {
+  const t = raw.replace(/[^\d.]/g, "");
+  const i = t.indexOf(".");
+  if (i === -1) return t;
+  return t.slice(0, i + 1) + t.slice(i + 1).replace(/\./g, "");
+}
+
+function emptyForm(): ProjectForm {
+  return {
+    code: "",
+    status: "DRAFT",
+    country: "",
+    exporter: "",
+    item: "GREEN BEAN",
+    client: "",
+    businessModel: "",
+    incoterms: "",
+    hsCode: "",
+    customRate: "",
+    vatRate: "",
+    priceValue: "",
+    priceCurrency: "USD",
+    priceUnit: "KG",
+    offerPriceValue: "",
+    offerPriceCurrency: "USD",
+    offerPriceUnit: "KG",
+    finalPriceValue: "",
+    finalPriceCurrency: "USD",
+    finalPriceUnit: "KG",
+    note: "",
+  };
+}
+
+function createStep(label: string): Step {
+  return {
+    id: createId("step"),
+    label,
+    checked: false,
+    dueDate: "",
+    dueReminderSentMap: {},
+    confirmedAt: "",
+    memo: "",
+    assigneeMemberId: "",
+    comments: [],
+  };
+}
+
+function createPhase(title: string, stepLabels: string[], expanded = false): Phase {
+  return {
+    id: createId("phase"),
+    title,
+    expanded,
+    steps: stepLabels.map((label) => createStep(label)),
+  };
+}
+
+function createFixedFlowchartPhases(): Phase[] {
+  return [
+    createPhase("PHASE 1 — Planning", [
+      "1. Business Model Check",
+      "2. Import Availability",
+      "3. Pricing",
+    ]),
+    createPhase("PHASE 2 — Ordering", [
+      "4. Overseas Order",
+      "5. PSS Test",
+      "6. Packing & Label",
+    ]),
+    createPhase("PHASE 3 — Shipping", [
+      "7. Booking",
+      "8. Shipping Document",
+      "9. Payment",
+    ]),
+    createPhase("PHASE 4 — Clearance", [
+      "10. Arrival",
+      "11. Inspection",
+      "12. Clearance",
+    ]),
+    createPhase("PHASE 5 — Closing", [
+      "13. Warehouse",
+      "14. Invoice",
+      "15. Feedback",
+    ]),
+  ];
+}
+
+/** 저장본에 남아 있을 수 있는 레거시 필드 제거 후 Project로 복원 */
+function projectFromStorage(raw: unknown): Project {
+  const p = { ...(raw as Record<string, unknown>) };
+  delete p.projectMemberIds;
+  return makeProject(p as Partial<Project>);
+}
+
+function sanitizeAssigneesAgainstMembers(projects: Project[], validMemberIds: Set<string>): Project[] {
+  return projects.map((project) => ({
+    ...project,
+    phases: project.phases.map((phase) => ({
+      ...phase,
+      steps: phase.steps.map((step) =>
+        step.assigneeMemberId && !validMemberIds.has(step.assigneeMemberId)
+          ? { ...step, assigneeMemberId: "" }
+          : step
+      ),
+    })),
+  }));
+}
+
+function normalizeStepFromStorage(step: Step & { dueReminderSentAt?: string }): Step {
+  const { dueReminderSentAt: _legacy, ...rest } = step;
+  const r = rest as unknown as Record<string, unknown>;
+  return {
+    ...rest,
+    dueReminderSentMap: normalizeDueReminderSentMapFromWire(r.dueReminderSentMap),
+  };
+}
+
+function normalizePhasesFromStorage(phases: Phase[]): Phase[] {
+  return phases.map((phase) => ({
+    ...phase,
+    steps: phase.steps.map(normalizeStepFromStorage),
+  }));
+}
+
+function makeProject(data?: Partial<Project & { dutyRate?: string }>): Project {
+  const rawPhases = data?.phases ?? createFixedFlowchartPhases();
+  const legacyDuty = data?.dutyRate;
+  return {
+    id: data?.id ?? createId("project"),
+    code: data?.code ?? "DRAFT",
+    status: data?.status ?? "DRAFT",
+    country: data?.country ?? "",
+    exporter: data?.exporter ?? "",
+    item: data?.item ?? "GREEN BEAN",
+    client: data?.client ?? "",
+    businessModel: data?.businessModel ?? "",
+    incoterms: data?.incoterms ?? "",
+    hsCode: data?.hsCode ?? "",
+    customRate: sanitizeRateDigits(String(data?.customRate ?? legacyDuty ?? "")),
+    vatRate: sanitizeRateDigits(String(data?.vatRate ?? "")),
+    priceValue: data?.priceValue ?? "",
+    priceCurrency: normalizePriceCurrency(data?.priceCurrency),
+    priceUnit: normalizePriceUnit(data?.priceUnit),
+    offerPriceValue: data?.offerPriceValue ?? "",
+    offerPriceCurrency: normalizePriceCurrency(data?.offerPriceCurrency),
+    offerPriceUnit: normalizePriceUnit(data?.offerPriceUnit),
+    finalPriceValue: data?.finalPriceValue ?? "",
+    finalPriceCurrency: normalizePriceCurrency(data?.finalPriceCurrency),
+    finalPriceUnit: normalizePriceUnit(data?.finalPriceUnit),
+    note: data?.note ?? "",
+    updated: data?.updated ?? true,
+    lastChangedAt: data?.lastChangedAt ?? nowString(),
+    phases: normalizePhasesFromStorage(rawPhases),
+    notificationLogs: data?.notificationLogs ?? [],
+  };
+}
+
+const initialProjects: Project[] = [
+  makeProject({
+    code: "DRAFT",
+    note: "여기서 직접 수정 시작",
+  }),
+];
+
+function getProjectProgress(project: Project) {
+  const steps = project.phases.flatMap((phase) => phase.steps);
+  const total = steps.length;
+  const done = steps.filter((step) => step.checked).length;
+  const percent = total === 0 ? 0 : Math.round((done / total) * 100);
+  return { total, done, percent };
+}
+
+function getNextDueStep(project: Project) {
+  const steps = project.phases.flatMap((phase) =>
+    phase.steps
+      .filter((step) => !step.checked && step.dueDate)
+      .map((step) => ({
+        phaseTitle: phase.title,
+        ...step,
+      }))
+  );
+
+  if (!steps.length) return null;
+
+  return steps.sort((a, b) => {
+    const aTime = parseDateSafe(a.dueDate)?.getTime() ?? Infinity;
+    const bTime = parseDateSafe(b.dueDate)?.getTime() ?? Infinity;
+    return aTime - bTime;
+  })[0];
+}
+
+function getOverdueCount(project: Project) {
+  return project.phases
+    .flatMap((phase) => phase.steps)
+    .filter((step) => !step.checked && step.dueDate && isStepDueOverdue(step.dueDate)).length;
+}
+
+function getPhaseOverdueCount(phase: Phase) {
+  return phase.steps.filter((step) => !step.checked && step.dueDate && isStepDueOverdue(step.dueDate)).length;
+}
+
+function badgeStyle(status: ProjectStatus) {
+  if (status === "REVIEW") return "border-violet-200 bg-violet-50 text-violet-700";
+  if (status === "IN PROGRESS") return "border-blue-200 bg-blue-50 text-blue-700";
+  if (status === "HOLD") return "border-amber-200 bg-amber-50 text-amber-700";
+  if (status === "DONE") return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  return "border-neutral-200 bg-neutral-100 text-neutral-700";
+}
+
+function itemPillStyle(item: string) {
+  if (item === "GREEN BEAN") return "bg-[#dfe9df] text-[#43624b]";
+  if (item === "INSTANT COFFEE") return "bg-[#e8e1e5] text-[#4f4c4d]";
+  if (item === "DECAF GREEN") return "bg-[#e8def4] text-[#6d558a]";
+  if (item === "TEA EXTRACT") return "bg-[#dde8dc] text-[#496150]";
+  if (item === "TEMPLATE") return "bg-[#ece2c6] text-[#7a6934]";
+  return "bg-neutral-100 text-neutral-700";
+}
+
+function Field({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="rounded-2xl border border-neutral-200 bg-white px-3 py-2.5">
+      <div className="mb-1.5 text-[10px] uppercase tracking-[0.16em] text-neutral-500">{label}</div>
+      {children}
+    </div>
+  );
+}
+
+function PercentSuffixInput({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder: string;
+}) {
+  return (
+    <div className="flex items-center gap-1 rounded-xl border border-neutral-200 bg-[#fafafa] px-2 py-1">
+      <input
+        value={value}
+        onChange={(e) => onChange(sanitizeRateDigits(e.target.value))}
+        placeholder={placeholder}
+        inputMode="decimal"
+        className="min-w-0 flex-1 bg-transparent text-[13px] text-neutral-900 outline-none placeholder:text-neutral-400"
+      />
+      <span className="shrink-0 text-[13px] text-neutral-500">%</span>
+    </div>
+  );
+}
+
+function PriceTripletEditor({
+  value,
+  currency,
+  unit,
+  onValue,
+  onCurrency,
+  onUnit,
+  placeholder,
+}: {
+  value: string;
+  currency: PriceCurrency;
+  unit: PriceUnit;
+  onValue: (v: string) => void;
+  onCurrency: (v: PriceCurrency) => void;
+  onUnit: (v: PriceUnit) => void;
+  placeholder: string;
+}) {
+  const display =
+    value.trim() === ""
+      ? ""
+      : currency === "KRW"
+        ? `${value.trim()}원/${unit}`
+        : `${value.trim()}$/${unit}`;
+  return (
+    <div className="space-y-1">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <input
+          value={value}
+          onChange={(e) => onValue(sanitizeRateDigits(e.target.value))}
+          placeholder={placeholder}
+          inputMode="decimal"
+          className="min-w-[3.5rem] flex-1 rounded-lg border border-neutral-200 bg-white px-2 py-1 text-[13px] outline-none"
+        />
+        <select
+          value={currency}
+          onChange={(e) => onCurrency(e.target.value as PriceCurrency)}
+          className="rounded-lg border border-neutral-200 bg-white px-1.5 py-1 text-[12px]"
+        >
+          <option value="USD">USD</option>
+          <option value="KRW">KRW</option>
+        </select>
+        <select
+          value={unit}
+          onChange={(e) => onUnit(e.target.value as PriceUnit)}
+          className="rounded-lg border border-neutral-200 bg-white px-1.5 py-1 text-[12px]"
+        >
+          <option value="KG">KG</option>
+          <option value="LB">LB</option>
+          <option value="UNIT">UNIT</option>
+        </select>
+      </div>
+      {display ? <div className="text-[10px] text-neutral-500">{display}</div> : null}
+    </div>
+  );
+}
+
+function Input({
+  value,
+  onChange,
+  placeholder,
+  type = "text",
+  readOnly = false,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  type?: string;
+  readOnly?: boolean;
+}) {
+  return (
+    <input
+      value={value ?? ""}
+      type={type}
+      autoComplete="off"
+      disabled={false}
+      readOnly={readOnly}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder={placeholder}
+      className="w-full bg-transparent text-[14px] text-neutral-900 outline-none placeholder:text-neutral-400 read-only:cursor-default disabled:opacity-100"
+    />
+  );
+}
+
+function TextArea({
+  value,
+  onChange,
+  placeholder,
+  rows = 3,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  rows?: number;
+}) {
+  return (
+    <textarea
+      value={value ?? ""}
+      rows={rows}
+      autoComplete="off"
+      disabled={false}
+      readOnly={false}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder={placeholder}
+      className="w-full resize-none bg-transparent text-[14px] text-neutral-900 outline-none placeholder:text-neutral-400 disabled:opacity-100"
+    />
+  );
+}
+
+function Select({
+  value,
+  onChange,
+  options,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  options: string[];
+}) {
+  return (
+    <select
+      value={value ?? ""}
+      onChange={(e) => onChange(e.target.value)}
+      className="w-full bg-transparent text-[14px] text-neutral-900 outline-none"
+    >
+      {options.map((option) => (
+        <option key={option} value={option}>
+          {option}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function MemberInitial({ name }: { name: string }) {
+  const initial = name.trim().charAt(0).toUpperCase() || "?";
+  return (
+    <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-slate-900 text-[11px] font-bold text-white">
+      {initial}
+    </span>
+  );
+}
+
+function renderMentions(message: string, mentions: Mention[]) {
+  if (!mentions.length) return message;
+
+  const sorted = [...mentions].sort((a, b) => b.name.length - a.name.length);
+  let parts: React.ReactNode[] = [message];
+
+  sorted.forEach((mention) => {
+    const nextParts: React.ReactNode[] = [];
+
+    parts.forEach((part, index) => {
+      if (typeof part !== "string") {
+        nextParts.push(part);
+        return;
+      }
+
+      const token = `@${mention.name}`;
+      const split = part.split(token);
+
+      split.forEach((chunk, chunkIndex) => {
+        if (chunk) nextParts.push(chunk);
+        if (chunkIndex < split.length - 1) {
+          nextParts.push(
+            <span
+              key={`${mention.memberId}-${index}-${chunkIndex}`}
+              className="rounded-full bg-blue-50 px-2 py-0.5 text-blue-700"
+            >
+              {token}
+            </span>
+          );
+        }
+      });
+    });
+
+    parts = nextParts;
+  });
+
+  return parts;
+}
+
+function extractMentionQuery(value: string) {
+  const match = value.match(/@([^\s@]*)$/);
+  return match ? match[1] : null;
+}
+
+function applyDueReminderJobResults(prev: Project[], results: DueReminderJobResult[]): Project[] {
+  const ok = results.filter((r) => r.ok && r.sentAt && r.reminderOffset);
+  if (!ok.length) return prev;
+
+  const mergeByStep = new Map<string, DueReminderSentMap>();
+  for (const r of ok) {
+    const sk = `${r.projectId}\t${r.phaseId}\t${r.stepId}`;
+    const cur = mergeByStep.get(sk) ?? {};
+    const o = r.reminderOffset;
+    const prevAt = cur[o];
+    if (!prevAt || (r.sentAt && r.sentAt > prevAt)) {
+      mergeByStep.set(sk, { ...cur, [o]: r.sentAt! });
+    }
+  }
+
+  return prev.map((project) => {
+    let projectTouched = false;
+    const phases = project.phases.map((phase) => ({
+      ...phase,
+      steps: phase.steps.map((step) => {
+        const sk = `${project.id}\t${phase.id}\t${step.id}`;
+        const newMap = mergeByStep.get(sk);
+        if (!newMap || !Object.keys(newMap).length) return step;
+        projectTouched = true;
+        return { ...step, dueReminderSentMap: { ...step.dueReminderSentMap, ...newMap } };
+      }),
+    }));
+    return projectTouched
+      ? { ...project, phases, updated: true, lastChangedAt: nowString() }
+      : project;
+  });
+}
+
+function dashboardDataFingerprint(projects: Project[]): string {
+  const p = [...projects].sort((a, b) => a.id.localeCompare(b.id));
+  return JSON.stringify({ projects: p });
+}
+
+/** 디버그: true면 fingerprint 같아도 setState 적용(평소 false 유지) */
+const DEBUG_REALTIME_DISABLE_FINGERPRINT_SKIP = false;
+
+/** public.projects / public.members 의 share_id(uuid) 와 Realtime filter 호환 여부 */
+const SHARE_ID_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function realtimePayloadShareId(payload: {
+  new?: { share_id?: string };
+  old?: { share_id?: string };
+}): string | undefined {
+  return payload.new?.share_id ?? payload.old?.share_id;
+}
+
+function realtimeEventMatchesShare(
+  payload: { new?: { share_id?: string }; old?: { share_id?: string } },
+  shareId: string
+): boolean {
+  return realtimePayloadShareId(payload) === shareId;
+}
+
+export default function Page() {
+  const [projects, setProjects] = useState<Project[]>(initialProjects);
+  const [selectedId, setSelectedId] = useState<string>(initialProjects[0]?.id ?? "");
+
+  const [globalMembers, setGlobalMembers] = useState<Member[]>([]);
+  const [authUserId, setAuthUserId] = useState<string | null>(null);
+  const [authUserEmail, setAuthUserEmail] = useState<string | null>(null);
+  const [memberPanelOpen, setMemberPanelOpen] = useState(false);
+
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [filterOpen, setFilterOpen] = useState(false);
+
+  const [formMode, setFormMode] = useState<FormMode>("create");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [form, setForm] = useState<ProjectForm>(emptyForm());
+
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("ALL");
+  const [countryFilter, setCountryFilter] = useState("ALL");
+  const [itemFilter, setItemFilter] = useState("ALL");
+  const [clientFilter, setClientFilter] = useState("ALL");
+  const [exporterFilter, setExporterFilter] = useState("ALL");
+  const [overdueFilter, setOverdueFilter] = useState("ALL");
+  const [sortBy, setSortBy] = useState<SortOption>("UPDATED_DESC");
+
+  const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({});
+  const [commentOpenMap, setCommentOpenMap] = useState<Record<string, boolean>>({});
+  const [savingCommentStepId, setSavingCommentStepId] = useState<string | null>(null);
+  const [dueReminderBusy, setDueReminderBusy] = useState(false);
+  /** 첫 로드(Supabase 또는 레거시 localStorage) 완료 전에는 저장하지 않음 */
+  const [storageReady, setStorageReady] = useState(false);
+
+  const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const realtimeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastRemoteFingerprintRef = useRef<string>("");
+  const realtimeChannelRef = useRef<RealtimeChannel | null>(null);
+  const remoteProjectsLoadGenRef = useRef(0);
+  /** 원격 프로젝트 병합·Realtime 시 assignee sanitize용 (멤버는 Supabase와 무관) */
+  const localMembersSnapshotRef = useRef<Member[]>([]);
+  const supabaseProjectsBootstrappedRef = useRef(false);
+  const realtimeMembersDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** 병렬 loadMembersOnly 응답이 늦게 도착해 최신 멤버 목록을 덮어쓰지 않도록 함 */
+  const membersRefreshSeqRef = useRef(0);
+
+  const canDeleteMembers = useMemo(() => {
+    if (isBoardAdminEmail(authUserEmail)) return true;
+    if (
+      authUserId &&
+      globalMembers.some((m) => m.userId === authUserId && m.role === "관리자")
+    ) {
+      return true;
+    }
+    return false;
+  }, [authUserEmail, authUserId, globalMembers]);
+
+  const refreshMembersFromServer = useCallback(async () => {
+    if (!isSupabaseDashboardEnabled() || !getFlowchartShareId()?.trim()) return;
+    const seq = ++membersRefreshSeqRef.current;
+    try {
+      const { members } = await loadMembersOnly();
+      if (seq !== membersRefreshSeqRef.current) return;
+      const mapped = members.map(mapMemberRowToPageMember);
+      setGlobalMembers(mapped);
+      localMembersSnapshotRef.current = mapped;
+    } catch (e) {
+      console.error("[flowchart] loadMembersOnly failed", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    localMembersSnapshotRef.current = globalMembers;
+  }, [globalMembers]);
+
+  useEffect(() => {
+    if (!isSupabaseDashboardEnabled()) return;
+    const sb = getSupabaseBrowserClient();
+    let cancelled = false;
+
+    void sb.auth.getUser().then(({ data: { user } }) => {
+      if (cancelled) return;
+      setAuthUserId(user?.id ?? null);
+      setAuthUserEmail(user?.email ?? null);
+      if (!user) {
+        window.location.href = "/login";
+      }
+    });
+
+    const {
+      data: { subscription },
+    } = sb.auth.onAuthStateChange((_event, session) => {
+      setAuthUserId(session?.user?.id ?? null);
+      setAuthUserEmail(session?.user?.email ?? null);
+      if (!session?.user) {
+        window.location.href = "/login";
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  const subscriptionShareId =
+    storageReady && isSupabaseDashboardEnabled() ? getFlowchartShareId()?.trim() || null : null;
+
+  useEffect(() => {
+    if (!isSupabaseDashboardEnabled() || !getFlowchartShareId()?.trim() || !authUserId) return;
+
+    let cancelled = false;
+
+    async function heartbeat() {
+      if (cancelled) return;
+      const r = await touchBoardMemberHeartbeat();
+      if (!r.ok) {
+        console.error("[flowchart] touchBoardMemberHeartbeat", r);
+      }
+      await refreshMembersFromServer();
+    }
+
+    void heartbeat();
+    const id = window.setInterval(() => void heartbeat(), 30_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [authUserId, storageReady, refreshMembersFromServer]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let hydratedMembers: Member[] = [];
+
+    try {
+      const raw = localStorage.getItem(FLOWCHART_LEGACY_STORAGE_KEY);
+      if (raw) {
+        const parsed = parsePersistedJson(raw);
+        if (parsed) {
+          if (parsed.globalMembers != null && !isSupabaseDashboardEnabled()) {
+            hydratedMembers = normalizeStoredMembers(parsed.globalMembers);
+            if (!cancelled) {
+              setGlobalMembers(hydratedMembers);
+              localMembersSnapshotRef.current = hydratedMembers;
+            }
+          }
+          if (Array.isArray(parsed.projects)) {
+            const restored = normalizeStoredProjects(parsed.projects);
+            const memberIds = new Set(hydratedMembers.map((m) => m.id));
+            const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
+            if (!cancelled && next.length > 0) {
+              setProjects(next);
+              const ids = new Set(next.map((p) => p.id));
+              const rawSid = parsed.selectedId;
+              const sid =
+                next.length === 0
+                  ? ""
+                  : typeof rawSid === "string" && ids.has(rawSid)
+                    ? rawSid
+                    : (next[0]?.id ?? "");
+              setSelectedId(sid);
+            }
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    if (!isSupabaseDashboardEnabled()) {
+      if (!cancelled) {
+        supabaseProjectsBootstrappedRef.current = true;
+        setStorageReady(true);
+      }
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    /* 원격 프로젝트 로드 전에도 localStorage persist(멤버 포함)가 돌 수 있게 함 */
+    if (!cancelled) {
+      setStorageReady(true);
+    }
+
+    async function loadRemoteProjectsIfNeeded() {
+
+      const {
+        data: { user },
+      } = await getSupabaseBrowserClient().auth.getUser();
+      if (cancelled) return;
+      if (!user) {
+        supabaseProjectsBootstrappedRef.current = true;
+        setStorageReady(true);
+        return;
+      }
+
+      const shareId = getFlowchartShareId()?.trim() ?? "";
+      if (!shareId) {
+        if (!cancelled) {
+          supabaseProjectsBootstrappedRef.current = true;
+          setStorageReady(true);
+        }
+        return;
+      }
+
+      const loadGen = ++remoteProjectsLoadGenRef.current;
+      try {
+        const ensured = await ensureBoardMemberForCurrentUser();
+        if (!ensured.ok) {
+          console.error("[flowchart] ensureBoardMemberForCurrentUser failed", ensured);
+        }
+        if (!cancelled) {
+          try {
+            const { members: mbRows } = await loadMembersOnly();
+            const mapped = mbRows.map(mapMemberRowToPageMember);
+            setGlobalMembers(mapped);
+            localMembersSnapshotRef.current = mapped;
+          } catch (me) {
+            console.error("[flowchart] loadMembersOnly failed", me);
+          }
+        }
+        const data = await loadProjectsOnly();
+        if (cancelled || loadGen !== remoteProjectsLoadGenRef.current) return;
+
+        const memberIds = new Set(localMembersSnapshotRef.current.map((m) => m.id));
+        const restored = normalizeStoredProjects(
+          data.projects.map((row) => projectFromStorage(rowToProject(row as ProjectRow)))
+        );
+        const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
+        const finalProjects = next.length > 0 ? next : initialProjects;
+        setProjects(finalProjects);
+        setSelectedId((prev) => {
+          const ids = new Set(finalProjects.map((p) => p.id));
+          if (finalProjects.length === 0) return "";
+          if (ids.has(prev)) return prev;
+          return finalProjects[0]?.id ?? "";
+        });
+      } catch (e) {
+        console.error("[flowchart] loadProjectsOnly failed", e);
+      } finally {
+        if (!cancelled) {
+          supabaseProjectsBootstrappedRef.current = true;
+          setStorageReady(true);
+        }
+      }
+    }
+
+    void loadRemoteProjectsIfNeeded();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !storageReady) return;
+    try {
+      const payload: PersistedState = {
+        projects,
+        selectedId,
+        globalMembers: isSupabaseDashboardEnabled() ? [] : globalMembers,
+      };
+      localStorage.setItem(FLOWCHART_LEGACY_STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // 할당량 초과 등
+    }
+  }, [projects, selectedId, globalMembers, storageReady]);
+
+  useEffect(() => {
+    if (!isSupabaseDashboardEnabled() || !storageReady) return;
+    if (!getFlowchartShareId()) return;
+    if (!supabaseProjectsBootstrappedRef.current) return;
+
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = setTimeout(() => {
+      syncTimerRef.current = null;
+      if (!supabaseProjectsBootstrappedRef.current) return;
+      void syncProjectsOnly(projects).catch((e) => {
+        console.error("[flowchart] syncProjectsOnly failed", e);
+      });
+    }, 800);
+
+    return () => {
+      if (syncTimerRef.current) {
+        clearTimeout(syncTimerRef.current);
+        syncTimerRef.current = null;
+      }
+    };
+  }, [projects, storageReady]);
+
+  useEffect(() => {
+    function teardownRealtimeChannel() {
+      if (realtimeDebounceRef.current) {
+        clearTimeout(realtimeDebounceRef.current);
+        realtimeDebounceRef.current = null;
+      }
+      if (realtimeMembersDebounceRef.current) {
+        clearTimeout(realtimeMembersDebounceRef.current);
+        realtimeMembersDebounceRef.current = null;
+      }
+      const ch = realtimeChannelRef.current;
+      if (!ch) return;
+      try {
+        void getSupabaseBrowserClient().removeChannel(ch);
+      } catch {
+        /* 클라이언트 미구성 시 무시 */
+      }
+      realtimeChannelRef.current = null;
+    }
+
+    if (!subscriptionShareId) {
+      teardownRealtimeChannel();
+      return;
+    }
+
+    const sb = getSupabaseBrowserClient();
+    const shareIdLocked: string = subscriptionShareId;
+    const useServerFilter = SHARE_ID_UUID_RE.test(shareIdLocked);
+
+    teardownRealtimeChannel();
+
+    async function applyRemoteDashboard() {
+      const loadGen = ++remoteProjectsLoadGenRef.current;
+      try {
+        const data = await loadProjectsOnly();
+        if (loadGen !== remoteProjectsLoadGenRef.current) {
+          return;
+        }
+        const memberIds = new Set(localMembersSnapshotRef.current.map((m) => m.id));
+        const restored = normalizeStoredProjects(
+          data.projects.map((row) => projectFromStorage(rowToProject(row as ProjectRow)))
+        );
+        const next = sanitizeAssigneesAgainstMembers(restored, memberIds);
+        const finalProjects = next.length > 0 ? next : initialProjects;
+
+        const fp = dashboardDataFingerprint(finalProjects);
+        const fpSame = fp === lastRemoteFingerprintRef.current;
+
+        if (fpSame && !DEBUG_REALTIME_DISABLE_FINGERPRINT_SKIP) {
+          return;
+        }
+
+        lastRemoteFingerprintRef.current = fp;
+
+        setProjects(finalProjects);
+        setSelectedId((prev) => {
+          const ids = new Set(finalProjects.map((p) => p.id));
+          if (ids.has(prev)) {
+            return prev;
+          }
+          if (finalProjects.length === 0) {
+            return "";
+          }
+          const first = finalProjects[0]?.id ?? "";
+          return first;
+        });
+      } catch (e) {
+        console.error("[flowchart] realtime reload failed", e);
+      }
+    }
+
+    function scheduleRemoteReload(_source: string) {
+      if (realtimeDebounceRef.current) clearTimeout(realtimeDebounceRef.current);
+      realtimeDebounceRef.current = setTimeout(() => {
+        realtimeDebounceRef.current = null;
+        void applyRemoteDashboard();
+      }, 400);
+    }
+
+    function scheduleMembersReload() {
+      if (realtimeMembersDebounceRef.current) clearTimeout(realtimeMembersDebounceRef.current);
+      realtimeMembersDebounceRef.current = setTimeout(() => {
+        realtimeMembersDebounceRef.current = null;
+        void refreshMembersFromServer();
+      }, 400);
+    }
+
+    function onMembersPostgresChange() {
+      return (payload: {
+        eventType?: string;
+        new?: { share_id?: string };
+        old?: { share_id?: string };
+      }) => {
+        if (!useServerFilter && !realtimeEventMatchesShare(payload, shareIdLocked)) {
+          return;
+        }
+        scheduleMembersReload();
+      };
+    }
+
+    if (!useServerFilter) {
+      console.warn(
+        "[flowchart] realtime: NEXT_PUBLIC_FLOWCHART_SHARE_ID must be a UUID string. DB column share_id is uuid — Realtime filter `share_id=eq....` and sync may fail otherwise."
+      );
+    }
+
+    function onPostgresChange() {
+      return (payload: {
+        eventType?: string;
+        new?: { share_id?: string };
+        old?: { share_id?: string };
+      }) => {
+        if (!useServerFilter && !realtimeEventMatchesShare(payload, shareIdLocked)) {
+          return;
+        }
+        scheduleRemoteReload(`projects:${payload.eventType ?? "?"}`);
+      };
+    }
+
+    const channelTopic = `dashboard-realtime-${shareIdLocked}`;
+    const channel = sb.channel(channelTopic);
+    if (useServerFilter) {
+      const filter = `share_id=eq.${shareIdLocked}`;
+      channel.on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "projects", filter },
+        onPostgresChange()
+      );
+      channel.on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "members", filter },
+        onMembersPostgresChange()
+      );
+    } else {
+      channel.on("postgres_changes", { event: "*", schema: "public", table: "projects" }, onPostgresChange());
+      channel.on("postgres_changes", { event: "*", schema: "public", table: "members" }, onMembersPostgresChange());
+    }
+
+    channel.subscribe(() => {});
+
+    realtimeChannelRef.current = channel;
+
+    return () => {
+      teardownRealtimeChannel();
+    };
+  }, [subscriptionShareId, refreshMembersFromServer]);
+
+  const selectedProject = useMemo(
+    () => projects.find((project) => project.id === selectedId) ?? projects[0] ?? null,
+    [projects, selectedId]
+  );
+
+  const patchSelectedMeta = useCallback(
+    (patch: Partial<Project>) => {
+      if (!selectedProject) return;
+      const id = selectedProject.id;
+      const ts = nowString();
+      setProjects((prev) =>
+        prev.map((p) => (p.id === id ? { ...p, ...patch, updated: true, lastChangedAt: ts } : p))
+      );
+    },
+    [selectedProject]
+  );
+
+  const countryOptions = useMemo(
+    () => ["ALL", ...Array.from(new Set(projects.map((p) => p.country))).filter(Boolean)],
+    [projects]
+  );
+
+  const itemOptions = useMemo(
+    () => ["ALL", ...Array.from(new Set(projects.map((p) => p.item))).filter(Boolean)],
+    [projects]
+  );
+
+  const clientOptions = useMemo(
+    () => ["ALL", ...Array.from(new Set(projects.map((p) => p.client))).filter(Boolean)],
+    [projects]
+  );
+
+  const exporterOptions = useMemo(
+    () => ["ALL", ...Array.from(new Set(projects.map((p) => p.exporter))).filter(Boolean)],
+    [projects]
+  );
+
+  const filteredProjects = useMemo(() => {
+    const result = [...projects].filter((project) => {
+      const q = search.trim().toLowerCase();
+
+      const searchOk =
+        !q ||
+        [project.code, project.country, project.exporter, project.item, project.client, project.note]
+          .join(" ")
+          .toLowerCase()
+          .includes(q);
+
+      const statusOk = statusFilter === "ALL" || project.status === statusFilter;
+      const countryOk = countryFilter === "ALL" || project.country === countryFilter;
+      const itemOk = itemFilter === "ALL" || project.item === itemFilter;
+      const clientOk = clientFilter === "ALL" || project.client === clientFilter;
+      const exporterOk = exporterFilter === "ALL" || project.exporter === exporterFilter;
+
+      const overdueCount = getOverdueCount(project);
+      const overdueOk =
+        overdueFilter === "ALL" ||
+        (overdueFilter === "YES" && overdueCount > 0) ||
+        (overdueFilter === "NO" && overdueCount === 0);
+
+      return searchOk && statusOk && countryOk && itemOk && clientOk && exporterOk && overdueOk;
+    });
+
+    result.sort((a, b) => {
+      if (sortBy === "CODE_ASC") return a.code.localeCompare(b.code);
+      if (sortBy === "CODE_DESC") return b.code.localeCompare(a.code);
+      if (sortBy === "PROGRESS_DESC") return getProjectProgress(b).percent - getProjectProgress(a).percent;
+      return b.lastChangedAt.localeCompare(a.lastChangedAt);
+    });
+
+    return result;
+  }, [
+    projects,
+    search,
+    statusFilter,
+    countryFilter,
+    itemFilter,
+    clientFilter,
+    exporterFilter,
+    overdueFilter,
+    sortBy,
+  ]);
+
+  function updateFormField<K extends keyof ProjectForm>(key: K, value: ProjectForm[K]) {
+    setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  function openCreatePanel() {
+    setFormMode("create");
+    setEditingId(null);
+    setForm({ ...emptyForm(), code: "DRAFT", status: "DRAFT" });
+    setPanelOpen(true);
+  }
+
+  function openEditPanel(project: Project) {
+    setFormMode("edit");
+    setEditingId(project.id);
+    setForm({
+      code: project.code || "",
+      status: project.status,
+      country: project.country || "",
+      exporter: project.exporter || "",
+      item: project.item || "GREEN BEAN",
+      client: project.client || "",
+      businessModel: project.businessModel || "",
+      incoterms: project.incoterms || "",
+      hsCode: project.hsCode || "",
+      customRate: project.customRate || "",
+      vatRate: project.vatRate || "",
+      priceValue: project.priceValue || "",
+      priceCurrency: project.priceCurrency,
+      priceUnit: project.priceUnit,
+      offerPriceValue: project.offerPriceValue || "",
+      offerPriceCurrency: project.offerPriceCurrency,
+      offerPriceUnit: project.offerPriceUnit,
+      finalPriceValue: project.finalPriceValue || "",
+      finalPriceCurrency: project.finalPriceCurrency,
+      finalPriceUnit: project.finalPriceUnit,
+      note: project.note || "",
+    });
+    setPanelOpen(true);
+  }
+
+  function saveProject() {
+    const code = form.code.trim() || "DRAFT";
+
+    if (formMode === "create") {
+      const duplicate = projects.some((project) => project.code.toLowerCase() === code.toLowerCase());
+      if (duplicate) {
+        alert("중복 CODE입니다. 다른 CODE를 입력해주세요.");
+        return;
+      }
+
+      const newProject = makeProject({
+        code,
+        status: form.status,
+        country: form.country.trim().toUpperCase(),
+        exporter: form.exporter.trim(),
+        item: form.item.trim().toUpperCase(),
+        client: form.client.trim(),
+        businessModel: form.businessModel.trim(),
+        incoterms: form.incoterms.trim(),
+        hsCode: form.hsCode.trim(),
+        customRate: sanitizeRateDigits(form.customRate),
+        vatRate: sanitizeRateDigits(form.vatRate),
+        priceValue: sanitizeRateDigits(form.priceValue),
+        priceCurrency: form.priceCurrency,
+        priceUnit: form.priceUnit,
+        offerPriceValue: sanitizeRateDigits(form.offerPriceValue),
+        offerPriceCurrency: form.offerPriceCurrency,
+        offerPriceUnit: form.offerPriceUnit,
+        finalPriceValue: sanitizeRateDigits(form.finalPriceValue),
+        finalPriceCurrency: form.finalPriceCurrency,
+        finalPriceUnit: form.finalPriceUnit,
+        note: form.note.trim(),
+        updated: true,
+        lastChangedAt: nowString(),
+        phases: createFixedFlowchartPhases(),
+        notificationLogs: [],
+      });
+
+      setProjects((prev) => [newProject, ...prev]);
+      setSelectedId(newProject.id);
+      setPanelOpen(false);
+      setForm(emptyForm());
+      return;
+    }
+
+    if (formMode === "edit" && editingId) {
+      const duplicate = projects.some(
+        (project) => project.id !== editingId && project.code.toLowerCase() === code.toLowerCase()
+      );
+      if (duplicate) {
+        alert("다른 프로젝트가 이미 같은 CODE를 사용 중입니다.");
+        return;
+      }
+
+      setProjects((prev) =>
+        prev.map((project) =>
+          project.id === editingId
+            ? {
+                ...project,
+                code,
+                status: form.status,
+                country: form.country.trim().toUpperCase(),
+                exporter: form.exporter.trim(),
+                item: form.item.trim().toUpperCase(),
+                client: form.client.trim(),
+                businessModel: form.businessModel.trim(),
+                incoterms: form.incoterms.trim(),
+                hsCode: form.hsCode.trim(),
+                customRate: sanitizeRateDigits(form.customRate),
+                vatRate: sanitizeRateDigits(form.vatRate),
+                priceValue: sanitizeRateDigits(form.priceValue),
+                priceCurrency: form.priceCurrency,
+                priceUnit: form.priceUnit,
+                offerPriceValue: sanitizeRateDigits(form.offerPriceValue),
+                offerPriceCurrency: form.offerPriceCurrency,
+                offerPriceUnit: form.offerPriceUnit,
+                finalPriceValue: sanitizeRateDigits(form.finalPriceValue),
+                finalPriceCurrency: form.finalPriceCurrency,
+                finalPriceUnit: form.finalPriceUnit,
+                note: form.note.trim(),
+                updated: true,
+                lastChangedAt: nowString(),
+              }
+            : project
+        )
+      );
+
+      setPanelOpen(false);
+      setEditingId(null);
+      setForm(emptyForm());
+    }
+  }
+
+  function deleteSelectedProject() {
+    if (!selectedProject) return;
+    const ok = window.confirm(`${selectedProject.code} 프로젝트를 삭제할까요?`);
+    if (!ok) return;
+
+    const next = projects.filter((project) => project.id !== selectedProject.id);
+    setProjects(next);
+    setSelectedId(next[0]?.id ?? "");
+    setPanelOpen(false);
+  }
+
+  function updateStep(projectId: string, phaseId: string, stepId: string, patch: Partial<Step>) {
+    setProjects((prev) =>
+      prev.map((project) => {
+        if (project.id !== projectId) return project;
+        return {
+          ...project,
+          updated: true,
+          lastChangedAt: nowString(),
+          phases: project.phases.map((phase) =>
+            phase.id !== phaseId
+              ? phase
+              : {
+                  ...phase,
+                  steps: phase.steps.map((step) => {
+                    if (step.id !== stepId) return step;
+                    const next: Step = { ...step, ...patch };
+                    if (patch.dueDate !== undefined && patch.dueDate !== step.dueDate) {
+                      next.dueReminderSentMap = {};
+                    }
+                    if (patch.assigneeMemberId !== undefined && patch.assigneeMemberId !== step.assigneeMemberId) {
+                      next.dueReminderSentMap = {};
+                    }
+                    return next;
+                  }),
+                }
+          ),
+        };
+      })
+    );
+  }
+
+  function toggleStepChecked(projectId: string, phaseId: string, stepId: string, checked: boolean) {
+    setProjects((prev) =>
+      prev.map((project) => {
+        if (project.id !== projectId) return project;
+        return {
+          ...project,
+          updated: true,
+          lastChangedAt: nowString(),
+          phases: project.phases.map((phase) =>
+            phase.id !== phaseId
+              ? phase
+              : {
+                  ...phase,
+                  steps: phase.steps.map((step) =>
+                    step.id === stepId
+                      ? {
+                          ...step,
+                          checked,
+                          confirmedAt: checked ? isoNowLocal() : "",
+                          dueReminderSentMap: checked ? {} : step.dueReminderSentMap,
+                        }
+                      : step
+                  ),
+                }
+          ),
+        };
+      })
+    );
+  }
+
+  function togglePhase(projectId: string, phaseId: string) {
+    setProjects((prev) =>
+      prev.map((project) => {
+        if (project.id !== projectId) return project;
+        return {
+          ...project,
+          phases: project.phases.map((phase) =>
+            phase.id === phaseId ? { ...phase, expanded: !phase.expanded } : phase
+          ),
+        };
+      })
+    );
+  }
+
+  async function removeGlobalMember(memberId: string) {
+    const target = globalMembers.find((m) => m.id === memberId);
+    if (!target) return;
+
+    if (authUserId && target.userId && target.userId === authUserId) {
+      alert("본인 계정은 삭제할 수 없습니다.");
+      return;
+    }
+
+    if (!canDeleteMembers) {
+      alert("관리자만 멤버를 삭제할 수 있습니다.");
+      return;
+    }
+
+    if (isSupabaseDashboardEnabled() && getFlowchartShareId()) {
+      const res = await deleteBoardMemberAsAdmin(memberId);
+      if (!res.ok) {
+        alert(res.message ?? "삭제에 실패했습니다.");
+        return;
+      }
+      await refreshMembersFromServer();
+    } else {
+      setGlobalMembers(globalMembers.filter((member) => member.id !== memberId));
+    }
+
+    setProjects((prev) =>
+      prev.map((project) => ({
+        ...project,
+        phases: project.phases.map((phase) => ({
+          ...phase,
+          steps: phase.steps.map((step) =>
+            step.assigneeMemberId === memberId ? { ...step, assigneeMemberId: "" } : step
+          ),
+        })),
+      }))
+    );
+  }
+
+  function toggleCommentOpen(stepId: string) {
+    setCommentOpenMap((prev) => ({
+      ...prev,
+      [stepId]: !prev[stepId],
+    }));
+  }
+
+  function setCommentDraft(stepId: string, value: string) {
+    setCommentDrafts((prev) => ({
+      ...prev,
+      [stepId]: value,
+    }));
+  }
+
+  function applyMention(stepId: string, member: Member) {
+    const current = commentDrafts[stepId] ?? "";
+    const query = extractMentionQuery(current);
+    if (query === null) return;
+
+    const replaced = current.replace(/@([^\s@]*)$/, `@${member.name} `);
+    setCommentDraft(stepId, replaced);
+  }
+
+  async function addCommentWithMentions(projectId: string, phaseId: string, stepId: string) {
+    const draft = (commentDrafts[stepId] ?? "").trim();
+    if (!draft || !selectedProject) return;
+    if (savingCommentStepId) return;
+
+    const mentionedMembers = globalMembers.filter((member) => draft.includes(`@${member.name}`));
+
+    const mentions: Mention[] = mentionedMembers.map((member) => ({
+      memberId: member.id,
+      name: member.name,
+      email: member.email,
+    }));
+
+    const currentPhase = selectedProject.phases.find((phase) => phase.id === phaseId);
+    const currentStep = currentPhase?.steps.find((step) => step.id === stepId);
+    const commentCreatedAt = nowString();
+
+    setSavingCommentStepId(stepId);
+    let emailNotify: NotificationLog["emailNotify"];
+
+    try {
+      if (mentions.length) {
+        try {
+          const res = await fetch("/api/notify-mention", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              recipients: mentions.map((m) => ({ email: m.email, name: m.name })),
+              projectCode: selectedProject.code,
+              stepLabel: currentStep?.label ?? "",
+              phaseTitle: currentPhase?.title ?? "",
+              authorName: "나",
+              commentText: draft,
+              createdAt: commentCreatedAt,
+            }),
+          });
+
+          const data = (await res.json()) as MentionNotifyResponse & { error?: string };
+          if (!res.ok) {
+            throw new Error(data.error || `요청 실패 (${res.status})`);
+          }
+
+          const perRecipient = data.results.map((r) => ({
+            email: r.email,
+            name: r.name,
+            ok: r.ok,
+            error: r.error,
+          }));
+
+          emailNotify = {
+            attemptedAt: nowString(),
+            mock: data.mock,
+            overallOk: perRecipient.length > 0 && perRecipient.every((r) => r.ok),
+            perRecipient,
+          };
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : "알 수 없는 오류";
+          emailNotify = {
+            attemptedAt: nowString(),
+            mock: true,
+            overallOk: false,
+            overallError: msg,
+            perRecipient: mentions.map((m) => ({
+              email: m.email,
+              name: m.name,
+              ok: false,
+              error: msg,
+            })),
+          };
+        }
+      }
+
+      const comment: StepComment = {
+        id: createId("comment"),
+        authorName: "나",
+        message: draft,
+        mentions,
+        createdAt: commentCreatedAt,
+      };
+
+      const newLogs: NotificationLog[] = mentions.length
+        ? [
+            {
+              id: createId("log"),
+              kind: "mention",
+              projectCode: selectedProject.code,
+              phaseTitle: currentPhase?.title ?? "",
+              stepLabel: currentStep?.label ?? "",
+              authorName: "나",
+              commentText: draft,
+              recipients: mentions,
+              createdAt: commentCreatedAt,
+              emailNotify,
+            },
+          ]
+        : [];
+
+      setProjects((prev) =>
+        prev.map((project) => {
+          if (project.id !== projectId) return project;
+          return {
+            ...project,
+            updated: true,
+            lastChangedAt: nowString(),
+            notificationLogs: [...newLogs, ...project.notificationLogs],
+            phases: project.phases.map((phase) =>
+              phase.id !== phaseId
+                ? phase
+                : {
+                    ...phase,
+                    steps: phase.steps.map((step) =>
+                      step.id === stepId
+                        ? {
+                            ...step,
+                            comments: [comment, ...step.comments],
+                          }
+                        : step
+                    ),
+                  }
+            ),
+          };
+        })
+      );
+
+      setCommentDraft(stepId, "");
+    } finally {
+      setSavingCommentStepId(null);
+    }
+  }
+
+  async function runDueReminderScan() {
+    if (dueReminderBusy) return;
+    setDueReminderBusy(true);
+    try {
+      const appBaseUrl =
+        typeof window !== "undefined"
+          ? `${window.location.origin}${window.location.pathname}`
+          : undefined;
+      const body = buildDueReminderProcessRequest(
+        projects.map((p) => ({
+          id: p.id,
+          code: p.code,
+          phases: p.phases.map((ph) => ({
+            id: ph.id,
+            title: ph.title,
+            steps: ph.steps.map((s) => ({
+              id: s.id,
+              label: s.label,
+              checked: s.checked,
+              dueDate: s.dueDate,
+              assigneeMemberIds: s.assigneeMemberId ? [s.assigneeMemberId] : [],
+              dueReminderSentMap: s.dueReminderSentMap ?? {},
+            })),
+          })),
+        })),
+        globalMembers.map((m) => ({ id: m.id, name: m.name, email: m.email })),
+        appBaseUrl
+      );
+
+      const res = await fetch("/api/due-reminders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      const data = (await res.json()) as DueReminderProcessResponse & { error?: string };
+      if (!res.ok) {
+        throw new Error(data.error || `요청 실패 (${res.status})`);
+      }
+
+      setProjects((prev) => {
+        const processed = data.processed ?? [];
+        const nextProjects = applyDueReminderJobResults(prev, processed);
+        if (!processed.length) return nextProjects;
+
+        const extraByProject = new Map<string, NotificationLog[]>();
+
+        for (const r of processed) {
+          const proj = prev.find((p) => p.id === r.projectId);
+          if (!proj) continue;
+          const phase = proj.phases.find((ph) => ph.id === r.phaseId);
+          const step = phase?.steps.find((s) => s.id === r.stepId);
+          if (!phase || !step) continue;
+          const assignee = globalMembers.find((m) => m.id === step.assigneeMemberId);
+
+          const attemptedAt = r.sentAt || new Date().toISOString();
+          const dLabel = offsetToLabel(r.reminderOffset);
+          const log: NotificationLog = {
+            id: createId("log"),
+            kind: "due_reminder",
+            projectCode: proj.code,
+            phaseTitle: phase.title,
+            stepLabel: step.label,
+            authorName: "Due Reminder",
+            commentText: `${dLabel} 알림 · 마감: ${step.dueDate.replace("T", " ")}`,
+            recipients: assignee
+              ? [{ memberId: assignee.id, name: assignee.name, email: assignee.email }]
+              : [],
+            createdAt: nowString(),
+            emailNotify: {
+              attemptedAt,
+              mock: data.mock,
+              overallOk: r.ok,
+              overallError: r.error,
+              perRecipient: [
+                {
+                  email: assignee?.email ?? "",
+                  name: assignee?.name ?? "",
+                  ok: r.ok,
+                  error: r.error,
+                },
+              ],
+            },
+          };
+          extraByProject.set(proj.id, [...(extraByProject.get(proj.id) ?? []), log]);
+        }
+
+        return nextProjects.map((p) => {
+          const extra = extraByProject.get(p.id);
+          if (!extra?.length) return p;
+          return {
+            ...p,
+            updated: true,
+            lastChangedAt: nowString(),
+            notificationLogs: [...extra, ...p.notificationLogs],
+          };
+        });
+      });
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Due 알림 검사 실패");
+    } finally {
+      setDueReminderBusy(false);
+    }
+  }
+
+  const selectedProgress = selectedProject
+    ? getProjectProgress(selectedProject)
+    : { total: 0, done: 0, percent: 0 };
+
+  const selectedNextDue = selectedProject ? getNextDueStep(selectedProject) : null;
+  const selectedOverdueCount = selectedProject ? getOverdueCount(selectedProject) : 0;
+
+  async function handleLogout() {
+    console.log("[1] clicked");
+    const supabase = getSupabaseBrowserClient();
+    console.log("[2] before signOut");
+    try {
+      await supabase.auth.signOut();
+    } catch (e) {
+      console.error(e);
+    }
+    console.log("[3] after signOut");
+    localStorage.removeItem("flowchart-dashboard-v4");
+    try {
+      sessionStorage.clear();
+    } catch {
+      /* ignore */
+    }
+    console.log("[4] before redirect");
+    window.location.href = "/login";
+    console.log("[5] after redirect code reached");
+  }
+
+  return (
+    <div className="min-h-screen bg-[#f6f5f3] text-neutral-900">
+      <div className="mx-auto flex max-w-[1880px] gap-4 px-4 py-4">
+        <aside className="sticky top-4 z-40 flex h-[calc(100vh-2rem)] w-[340px] shrink-0 flex-col overflow-hidden rounded-[28px] border border-neutral-200 bg-white">
+          <div className="pointer-events-auto relative z-50 shrink-0 border-b border-neutral-200 px-5 py-5">
+            <div className="mb-2 flex items-center justify-end">
+              <button type="button" onClick={() => void handleLogout()} className="relative z-[60] cursor-pointer rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium text-neutral-600 pointer-events-auto hover:bg-neutral-50">
+                로그아웃
+              </button>
+            </div>
+            <div className="mb-1 text-[11px] uppercase tracking-[0.22em] text-neutral-500">Dashboard</div>
+            <div className="text-[30px] font-black tracking-[-0.05em]">FLOWCHART TEST</div>
+            <div className="mt-2 text-sm text-neutral-500">코드 중심 리스트 + 고정 15단계 플로우</div>
+          </div>
+
+          <div className="min-h-0 flex-1 overflow-y-auto border-b border-neutral-200 px-4 py-4">
+            <button
+              type="button"
+              onClick={() => setMemberPanelOpen((prev) => !prev)}
+              className="mb-3 w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm font-semibold"
+            >
+              {memberPanelOpen ? "Hide Members" : "Show Members"}
+            </button>
+
+            {memberPanelOpen && (
+              <div className="relative z-0 mb-3 rounded-[22px] border border-neutral-200 bg-[#f8f7f5]">
+                <div className="flex items-center justify-between border-b border-neutral-200 px-3 py-3">
+                  <div className="text-sm font-semibold">Members</div>
+                  <div className="text-xs text-neutral-500">{globalMembers.length}명</div>
+                </div>
+
+                <div className="max-h-[min(55vh,36rem)] space-y-4 overflow-y-auto p-3">
+                  <div className="space-y-2">
+                    {globalMembers.length === 0 ? (
+                      <div className="rounded-2xl border border-dashed border-neutral-200 bg-white px-4 py-5 text-center text-sm text-neutral-400">
+                        등록된 멤버가 없습니다.
+                      </div>
+                    ) : (
+                      globalMembers.map((member) => (
+                        <div
+                          key={member.id}
+                          className="flex items-center justify-between gap-3 rounded-2xl border border-neutral-200 bg-white px-3 py-3"
+                        >
+                          <div className="min-w-0 flex items-center gap-3">
+                            <MemberInitial name={member.name} />
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="truncate text-sm font-semibold">{member.name}</span>
+                                {member.userId &&
+                                authUserId &&
+                                member.userId === authUserId &&
+                                (!authUserEmail?.trim() ||
+                                  member.email.trim().toLowerCase() === authUserEmail.trim().toLowerCase()) ? (
+                                  <span className="shrink-0 rounded-md bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800">
+                                    나
+                                  </span>
+                                ) : null}
+                                {isMemberOnline(member.lastSeenAt) ? (
+                                  <span className="shrink-0 rounded-md bg-sky-100 px-1.5 py-0.5 text-[10px] font-semibold text-sky-800">
+                                    접속중
+                                  </span>
+                                ) : null}
+                              </div>
+                              <div className="truncate text-xs text-neutral-500">{member.email}</div>
+                            </div>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => void removeGlobalMember(member.id)}
+                            disabled={
+                              !canDeleteMembers ||
+                              Boolean(authUserId && member.userId && member.userId === authUserId)
+                            }
+                            className="rounded-xl border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            삭제
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={openCreatePanel}
+              className="mb-3 w-full rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white"
+            >
+              + New Project
+            </button>
+
+            {panelOpen && (
+              <div className="relative z-10 mb-3 rounded-[22px] border border-neutral-200 bg-[#f8f7f5]">
+                <div className="flex items-center justify-between border-b border-neutral-200 px-3 py-3">
+                  <div className="text-sm font-semibold">
+                    {formMode === "create" ? "Create Project" : "Edit Project"}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPanelOpen(false);
+                      setEditingId(null);
+                      setForm(emptyForm());
+                    }}
+                    className="rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium"
+                  >
+                    Close
+                  </button>
+                </div>
+
+                <div className="max-h-[55vh] space-y-3 overflow-y-auto p-3">
+                  <Field label="CODE">
+                    <Input
+                      value={form.code || ""}
+                      onChange={(v) => setForm((prev) => ({ ...prev, code: v }))}
+                      placeholder="예: DRAFT 또는 TATAMA-84"
+                    />
+                  </Field>
+
+                  <Field label="STATUS">
+                    <Select
+                      value={form.status || "DRAFT"}
+                      onChange={(v) => setForm((prev) => ({ ...prev, status: v as ProjectStatus }))}
+                      options={["DRAFT", "REVIEW", "IN PROGRESS", "HOLD", "DONE"]}
+                    />
+                  </Field>
+
+                  <Field label="ITEM">
+                    <Select
+                      value={form.item || "GREEN BEAN"}
+                      onChange={(v) => setForm((prev) => ({ ...prev, item: v }))}
+                      options={ITEM_OPTIONS}
+                    />
+                  </Field>
+
+                  <Field label="COUNTRY">
+                    <Input
+                      value={form.country || ""}
+                      onChange={(v) => setForm((prev) => ({ ...prev, country: v }))}
+                      placeholder="COUNTRY"
+                    />
+                  </Field>
+
+                  <Field label="EXPORTER">
+                    <Input
+                      value={form.exporter || ""}
+                      onChange={(v) => setForm((prev) => ({ ...prev, exporter: v }))}
+                      placeholder="EXPORTER"
+                    />
+                  </Field>
+
+                  <Field label="CLIENT">
+                    <Input
+                      value={form.client || ""}
+                      onChange={(v) => setForm((prev) => ({ ...prev, client: v }))}
+                      placeholder="CLIENT"
+                    />
+                  </Field>
+
+                  <Field label="BUSINESS MODEL">
+                    <Input
+                      value={form.businessModel}
+                      onChange={(v) => setForm((prev) => ({ ...prev, businessModel: v }))}
+                      placeholder="BUSINESS MODEL"
+                    />
+                  </Field>
+                  <Field label="H.S CODE">
+                    <Input
+                      value={form.hsCode}
+                      onChange={(v) => setForm((prev) => ({ ...prev, hsCode: v }))}
+                      placeholder="H.S CODE"
+                    />
+                  </Field>
+                  <Field label="INCOTERMS">
+                    <Input
+                      value={form.incoterms}
+                      onChange={(v) => setForm((prev) => ({ ...prev, incoterms: v }))}
+                      placeholder="INCOTERMS"
+                    />
+                  </Field>
+                  <Field label="CUSTOM">
+                    <PercentSuffixInput
+                      value={form.customRate}
+                      onChange={(v) => setForm((prev) => ({ ...prev, customRate: v }))}
+                      placeholder="8"
+                    />
+                  </Field>
+                  <Field label="VAT">
+                    <PercentSuffixInput
+                      value={form.vatRate}
+                      onChange={(v) => setForm((prev) => ({ ...prev, vatRate: v }))}
+                      placeholder="10"
+                    />
+                  </Field>
+                  <Field label="PRICE">
+                    <PriceTripletEditor
+                      value={form.priceValue}
+                      currency={form.priceCurrency}
+                      unit={form.priceUnit}
+                      onValue={(v) => setForm((prev) => ({ ...prev, priceValue: v }))}
+                      onCurrency={(c) => setForm((prev) => ({ ...prev, priceCurrency: c }))}
+                      onUnit={(u) => setForm((prev) => ({ ...prev, priceUnit: u }))}
+                      placeholder="7.9"
+                    />
+                  </Field>
+                  <Field label="OFFER PRICE">
+                    <PriceTripletEditor
+                      value={form.offerPriceValue}
+                      currency={form.offerPriceCurrency}
+                      unit={form.offerPriceUnit}
+                      onValue={(v) => setForm((prev) => ({ ...prev, offerPriceValue: v }))}
+                      onCurrency={(c) => setForm((prev) => ({ ...prev, offerPriceCurrency: c }))}
+                      onUnit={(u) => setForm((prev) => ({ ...prev, offerPriceUnit: u }))}
+                      placeholder="8.3"
+                    />
+                  </Field>
+                  <Field label="FINAL PRICE">
+                    <PriceTripletEditor
+                      value={form.finalPriceValue}
+                      currency={form.finalPriceCurrency}
+                      unit={form.finalPriceUnit}
+                      onValue={(v) => setForm((prev) => ({ ...prev, finalPriceValue: v }))}
+                      onCurrency={(c) => setForm((prev) => ({ ...prev, finalPriceCurrency: c }))}
+                      onUnit={(u) => setForm((prev) => ({ ...prev, finalPriceUnit: u }))}
+                      placeholder="7.6"
+                    />
+                  </Field>
+
+                  <Field label="NOTE">
+                    <TextArea
+                      value={form.note || ""}
+                      onChange={(v) => setForm((prev) => ({ ...prev, note: v }))}
+                      placeholder="NOTE"
+                      rows={4}
+                    />
+                  </Field>
+                </div>
+
+                <div className="border-t border-neutral-200 bg-[#f8f7f5] p-3">
+                  <button
+                    onClick={saveProject}
+                    type="button"
+                    className="w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm font-semibold"
+                  >
+                    {formMode === "create" ? "Create Project" : "Save Changes"}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-4 py-3">
+              <Input value={search} onChange={setSearch} placeholder="Search code / exporter / item / client" />
+            </div>
+
+            <button
+              onClick={() => setFilterOpen((prev) => !prev)}
+              className="mt-3 w-full rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm font-semibold"
+            >
+              {filterOpen ? "Hide Filters" : "Show Filters"}
+            </button>
+
+            {filterOpen && (
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2">
+                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Status</div>
+                  <Select
+                    value={statusFilter}
+                    onChange={setStatusFilter}
+                    options={["ALL", "DRAFT", "REVIEW", "IN PROGRESS", "HOLD", "DONE"]}
+                  />
+                </div>
+
+                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2">
+                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Country</div>
+                  <Select value={countryFilter} onChange={setCountryFilter} options={countryOptions} />
+                </div>
+
+                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2">
+                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Item</div>
+                  <Select value={itemFilter} onChange={setItemFilter} options={itemOptions} />
+                </div>
+
+                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2">
+                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Client</div>
+                  <Select value={clientFilter} onChange={setClientFilter} options={clientOptions} />
+                </div>
+
+                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2">
+                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Exporter</div>
+                  <Select value={exporterFilter} onChange={setExporterFilter} options={exporterOptions} />
+                </div>
+
+                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2">
+                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Sort</div>
+                  <Select
+                    value={sortBy}
+                    onChange={(v) => setSortBy(v as SortOption)}
+                    options={["UPDATED_DESC", "CODE_ASC", "CODE_DESC", "PROGRESS_DESC"]}
+                  />
+                </div>
+
+                <div className="rounded-2xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2 col-span-2">
+                  <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-neutral-500">Overdue</div>
+                  <Select value={overdueFilter} onChange={setOverdueFilter} options={["ALL", "YES", "NO"]} />
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="max-h-[38vh] shrink-0 overflow-y-auto border-t border-neutral-200 px-3 py-3">
+            <div className="mb-3 flex items-center justify-between px-2">
+              <div className="text-sm font-semibold text-neutral-700">Projects</div>
+              <div className="text-xs text-neutral-500">{filteredProjects.length}</div>
+            </div>
+
+            <div className="space-y-2">
+              {filteredProjects.map((project) => {
+                const selected = project.id === selectedId;
+                const overdueCount = getOverdueCount(project);
+                const progress = getProjectProgress(project);
+
+                return (
+                  <button
+                    key={project.id}
+                    onClick={() => setSelectedId(project.id)}
+                    className={`group w-full rounded-[20px] border px-4 py-4 text-left transition ${
+                      selected
+                        ? "border-slate-900 bg-slate-900 text-white"
+                        : "border-neutral-200 bg-white hover:border-neutral-300"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-[22px] font-black tracking-[-0.04em]">{project.code}</div>
+
+                        <div
+                          className={`overflow-hidden transition-all duration-200 ${
+                            selected
+                              ? "mt-2 max-h-16 opacity-100"
+                              : "mt-0 max-h-0 opacity-0 group-hover:mt-2 group-hover:max-h-16 group-hover:opacity-100"
+                          }`}
+                        >
+                          <div className={`text-xs ${selected ? "text-white/75" : "text-neutral-500"}`}>
+                            {project.exporter || "-"} · {project.client || "-"}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 pt-1">
+                        {project.updated && (
+                          <span className={`h-2.5 w-2.5 rounded-full ${selected ? "bg-emerald-300" : "bg-emerald-500"}`} />
+                        )}
+                        {overdueCount > 0 && (
+                          <span
+                            className={`rounded-full px-2 py-1 text-[11px] font-semibold ${
+                              selected ? "bg-rose-400/20 text-rose-100" : "bg-rose-50 text-rose-700"
+                            }`}
+                          >
+                            {overdueCount}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className={`mt-3 h-1.5 rounded-full ${selected ? "bg-white/15" : "bg-neutral-200"}`}>
+                      <div
+                        className={`h-1.5 rounded-full ${selected ? "bg-white" : "bg-slate-900"}`}
+                        style={{ width: `${progress.percent}%` }}
+                      />
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </aside>
+
+        <main className="relative z-0 min-w-0 flex-1">
+          {selectedProject ? (
+            <>
+              <section className="mb-4 rounded-[26px] border border-neutral-200 bg-white px-5 py-4">
+                <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+                  <div className="min-w-0 flex-1">
+                    <div className="mb-2 text-[11px] uppercase tracking-[0.22em] text-neutral-500">Selected Project</div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h1 className="text-[34px] font-black tracking-[-0.05em]">{selectedProject.code}</h1>
+                      <span className={`rounded-full border px-3 py-1.5 text-[11px] font-semibold ${badgeStyle(selectedProject.status)}`}>
+                        {selectedProject.status}
+                      </span>
+                      <span className={`rounded-md px-3 py-1.5 text-[11px] font-semibold ${itemPillStyle(selectedProject.item)}`}>
+                        {selectedProject.item}
+                      </span>
+                    </div>
+
+                    <div className="mt-2 flex flex-wrap gap-x-2 gap-y-1 text-[11px] text-neutral-500">
+                      <span>Progress {selectedProgress.percent}%</span>
+                      <span className="text-neutral-300">·</span>
+                      <span className="truncate">{selectedProject.lastChangedAt}</span>
+                    </div>
+
+                    <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7">
+                      <Field label="CODE">
+                        <Input
+                          value={selectedProject.code}
+                          onChange={(v) => patchSelectedMeta({ code: v })}
+                          placeholder="CODE"
+                        />
+                      </Field>
+                      <Field label="STATUS">
+                        <Select
+                          value={selectedProject.status}
+                          onChange={(v) => patchSelectedMeta({ status: v as ProjectStatus })}
+                          options={["DRAFT", "REVIEW", "IN PROGRESS", "HOLD", "DONE"]}
+                        />
+                      </Field>
+                      <Field label="ITEM">
+                        <Input
+                          value={selectedProject.item}
+                          onChange={(v) => patchSelectedMeta({ item: v.toUpperCase() })}
+                          placeholder="ITEM"
+                        />
+                      </Field>
+                      <Field label="COUNTRY">
+                        <Input
+                          value={selectedProject.country}
+                          onChange={(v) => patchSelectedMeta({ country: v.toUpperCase() })}
+                          placeholder="COUNTRY"
+                        />
+                      </Field>
+                      <Field label="EXPORTER">
+                        <Input
+                          value={selectedProject.exporter}
+                          onChange={(v) => patchSelectedMeta({ exporter: v })}
+                          placeholder="EXPORTER"
+                        />
+                      </Field>
+                      <Field label="CLIENT">
+                        <Input
+                          value={selectedProject.client}
+                          onChange={(v) => patchSelectedMeta({ client: v })}
+                          placeholder="CLIENT"
+                        />
+                      </Field>
+                      <Field label="BUSINESS MODEL">
+                        <Input
+                          value={selectedProject.businessModel}
+                          onChange={(v) => patchSelectedMeta({ businessModel: v })}
+                          placeholder="BUSINESS MODEL"
+                        />
+                      </Field>
+                    </div>
+
+                    <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7">
+                      <Field label="H.S CODE">
+                        <Input
+                          value={selectedProject.hsCode}
+                          onChange={(v) => patchSelectedMeta({ hsCode: v })}
+                          placeholder="H.S CODE"
+                        />
+                      </Field>
+                      <Field label="INCOTERMS">
+                        <Input
+                          value={selectedProject.incoterms}
+                          onChange={(v) => patchSelectedMeta({ incoterms: v })}
+                          placeholder="INCOTERMS"
+                        />
+                      </Field>
+                      <Field label="CUSTOM">
+                        <PercentSuffixInput
+                          value={selectedProject.customRate}
+                          onChange={(v) => patchSelectedMeta({ customRate: v })}
+                          placeholder="8"
+                        />
+                      </Field>
+                      <Field label="VAT">
+                        <PercentSuffixInput
+                          value={selectedProject.vatRate}
+                          onChange={(v) => patchSelectedMeta({ vatRate: v })}
+                          placeholder="10"
+                        />
+                      </Field>
+                      <Field label="PRICE">
+                        <PriceTripletEditor
+                          value={selectedProject.priceValue}
+                          currency={selectedProject.priceCurrency}
+                          unit={selectedProject.priceUnit}
+                          onValue={(v) => patchSelectedMeta({ priceValue: v })}
+                          onCurrency={(c) => patchSelectedMeta({ priceCurrency: c })}
+                          onUnit={(u) => patchSelectedMeta({ priceUnit: u })}
+                          placeholder="7.9"
+                        />
+                      </Field>
+                      <Field label="OFFER PRICE">
+                        <PriceTripletEditor
+                          value={selectedProject.offerPriceValue}
+                          currency={selectedProject.offerPriceCurrency}
+                          unit={selectedProject.offerPriceUnit}
+                          onValue={(v) => patchSelectedMeta({ offerPriceValue: v })}
+                          onCurrency={(c) => patchSelectedMeta({ offerPriceCurrency: c })}
+                          onUnit={(u) => patchSelectedMeta({ offerPriceUnit: u })}
+                          placeholder="8.3"
+                        />
+                      </Field>
+                      <Field label="FINAL PRICE">
+                        <PriceTripletEditor
+                          value={selectedProject.finalPriceValue}
+                          currency={selectedProject.finalPriceCurrency}
+                          unit={selectedProject.finalPriceUnit}
+                          onValue={(v) => patchSelectedMeta({ finalPriceValue: v })}
+                          onCurrency={(c) => patchSelectedMeta({ finalPriceCurrency: c })}
+                          onUnit={(u) => patchSelectedMeta({ finalPriceUnit: u })}
+                          placeholder="7.6"
+                        />
+                      </Field>
+                    </div>
+
+                    <div className="mt-3">
+                      <Field label="NOTE">
+                        <TextArea
+                          value={selectedProject.note}
+                          onChange={(v) => patchSelectedMeta({ note: v })}
+                          placeholder="플로우 메모"
+                          rows={2}
+                        />
+                      </Field>
+                    </div>
+                  </div>
+
+                  <div className="w-full xl:w-[220px]">
+                    <div className="grid grid-cols-1 gap-2">
+                      <button
+                        onClick={() => openEditPanel(selectedProject)}
+                        className="rounded-2xl border border-neutral-200 bg-white px-4 py-3 text-sm font-medium"
+                      >
+                        Edit Project
+                      </button>
+
+                      <button
+                        onClick={deleteSelectedProject}
+                        className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm font-medium text-rose-700"
+                      >
+                        Delete Project
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              <div className="grid grid-cols-1 gap-4 2xl:grid-cols-[minmax(0,1fr)_340px]">
+                <div className="min-w-0">
+                  <section className="mb-4 grid grid-cols-1 gap-4 xl:grid-cols-3">
+                    <div className="rounded-[22px] border border-neutral-200 bg-white p-4">
+                      <div className="text-[11px] uppercase tracking-[0.18em] text-neutral-500">Progress</div>
+                      <div className="mt-2 text-[26px] font-black">
+                        {selectedProgress.done}/{selectedProgress.total}
+                      </div>
+                      <div className="mt-3 h-2.5 rounded-full bg-neutral-200">
+                        <div className="h-2.5 rounded-full bg-slate-900" style={{ width: `${selectedProgress.percent}%` }} />
+                      </div>
+                    </div>
+
+                    <div className="rounded-[22px] border border-neutral-200 bg-white p-4">
+                      <div className="text-[11px] uppercase tracking-[0.18em] text-neutral-500">Next Due</div>
+                      {selectedNextDue ? (
+                        <>
+                          <div className="mt-2 text-[15px] font-bold">{selectedNextDue.label}</div>
+                          <div className="mt-1 text-sm text-neutral-500">{selectedNextDue.dueDate.replace("T", " ")}</div>
+                          <div className="mt-1 text-xs text-neutral-400">{selectedNextDue.phaseTitle}</div>
+                        </>
+                      ) : (
+                        <div className="mt-2 text-sm text-neutral-500">No due scheduled</div>
+                      )}
+                    </div>
+
+                    <div className="rounded-[22px] border border-neutral-200 bg-white p-4">
+                      <div className="text-[11px] uppercase tracking-[0.18em] text-neutral-500">Overdue</div>
+                      <div className={`mt-2 text-[26px] font-black ${selectedOverdueCount > 0 ? "text-rose-600" : "text-neutral-900"}`}>
+                        {selectedOverdueCount}
+                      </div>
+                      <div className="mt-1 text-sm text-neutral-500">unchecked steps</div>
+                    </div>
+                  </section>
+
+                  <section className="rounded-[26px] border border-neutral-200 bg-white p-5">
+                    <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+                      <div>
+                        <div className="mb-1 text-[11px] uppercase tracking-[0.22em] text-neutral-500">Flowchart</div>
+                        <h2 className="text-[22px] font-bold tracking-[-0.03em]">15-Step Checklist</h2>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={dueReminderBusy}
+                        onClick={() => {
+                          void runDueReminderScan();
+                        }}
+                        className="shrink-0 rounded-xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2 text-xs font-medium text-neutral-700 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {dueReminderBusy ? "검사 중…" : "Due Reminder 검사 (D-3/D-2/D-1)"}
+                      </button>
+                    </div>
+
+                    <div className="space-y-3">
+                      {selectedProject.phases.map((phase) => {
+                        const doneCount = phase.steps.filter((step) => step.checked).length;
+                        const phaseOverdueCount = getPhaseOverdueCount(phase);
+
+                        return (
+                          <div key={phase.id} className="overflow-hidden rounded-[22px] border border-neutral-200">
+                            <button
+                              onClick={() => togglePhase(selectedProject.id, phase.id)}
+                              className="flex w-full items-start justify-between gap-4 border-b border-neutral-200 bg-[#f8f7f5] px-4 py-4 text-left"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <div className="text-[18px] font-bold tracking-[-0.02em]">{phase.title}</div>
+                                  {phaseOverdueCount > 0 && (
+                                    <span className="rounded-full bg-rose-50 px-2 py-1 text-[11px] font-semibold text-rose-700">
+                                      {phaseOverdueCount} overdue
+                                    </span>
+                                  )}
+                                </div>
+
+                                <div className="mt-1 text-xs text-neutral-500">
+                                  {doneCount}/{phase.steps.length} done
+                                </div>
+
+                                {!phase.expanded && (
+                                  <div className="mt-2 text-sm leading-6 text-neutral-500">
+                                    {phase.steps.map((step) => step.label).join(" · ")}
+                                  </div>
+                                )}
+                              </div>
+
+                              <div className="pt-1 text-xl text-neutral-500">{phase.expanded ? "−" : "+"}</div>
+                            </button>
+
+                            {phase.expanded && (
+                              <div className="space-y-4 px-4 py-4">
+                                {phase.steps.map((step) => {
+                                  const overdue = !step.checked && !!step.dueDate && isStepDueOverdue(step.dueDate);
+                                  const dueSoon =
+                                    !step.checked && !!step.dueDate && !overdue
+                                      ? getDueSoonLabel(step.dueDate, Date.now())
+                                      : null;
+                                  const assigneeMember = globalMembers.find((m) => m.id === step.assigneeMemberId);
+                                  const commentDraft = commentDrafts[step.id] ?? "";
+                                  const mentionQuery = extractMentionQuery(commentDraft);
+                                  const mentionCandidates =
+                                    mentionQuery !== null
+                                      ? globalMembers.filter(
+                                          (member) =>
+                                            member.name.toLowerCase().includes(mentionQuery.toLowerCase()) ||
+                                            member.email.toLowerCase().includes(mentionQuery.toLowerCase())
+                                        )
+                                      : [];
+
+                                  return (
+                                    <div key={step.id} className="rounded-[20px] border border-neutral-200 bg-white px-4 py-4">
+                                      <div className="flex items-start gap-3">
+                                        <input
+                                          type="checkbox"
+                                          checked={step.checked}
+                                          onChange={(e) =>
+                                            toggleStepChecked(selectedProject.id, phase.id, step.id, e.target.checked)
+                                          }
+                                          className="mt-1 h-4 w-4 shrink-0 accent-blue-600"
+                                        />
+
+                                        <div className="min-w-0 flex-1">
+                                          <div className="text-[16px] font-medium text-neutral-900">{step.label}</div>
+
+                                          <div className="mt-2 flex flex-wrap gap-1.5">
+                                            {overdue ? (
+                                              <span className="inline-flex rounded-full border border-rose-200 bg-rose-50 px-2 py-1 text-[11px] font-medium text-rose-700">
+                                                OVERDUE
+                                              </span>
+                                            ) : null}
+                                            {dueSoon ? (
+                                              <span className="inline-flex rounded-full border border-emerald-200 bg-emerald-50 px-2 py-1 text-[11px] font-semibold text-emerald-800">
+                                                {dueSoon}
+                                              </span>
+                                            ) : null}
+                                          </div>
+
+                                          <div className="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-[240px_240px_minmax(0,1fr)_110px]">
+                                            <div className="rounded-xl border border-[#c8d5ff] bg-[#f5f8ff] px-3 py-2.5">
+                                              <div className="mb-1 text-[10px] uppercase tracking-[0.14em] text-neutral-500">
+                                                Due Date
+                                              </div>
+                                              <Input
+                                                type="datetime-local"
+                                                value={step.dueDate}
+                                                onChange={(v) =>
+                                                  updateStep(selectedProject.id, phase.id, step.id, { dueDate: v })
+                                                }
+                                              />
+                                            </div>
+
+                                            <div className="rounded-xl border border-neutral-200 bg-white px-3 py-2.5">
+                                              <div className="mb-1 text-[10px] uppercase tracking-[0.14em] text-neutral-500">
+                                                Confirmed At
+                                              </div>
+                                              <Input
+                                                type="datetime-local"
+                                                value={step.confirmedAt}
+                                                onChange={(v) =>
+                                                  updateStep(selectedProject.id, phase.id, step.id, { confirmedAt: v })
+                                                }
+                                              />
+                                            </div>
+
+                                            <div className="rounded-xl border border-[#c8d5ff] bg-[#f5f8ff] px-3 py-2.5">
+                                              <div className="mb-1 text-[10px] uppercase tracking-[0.14em] text-neutral-500">
+                                                Remark
+                                              </div>
+                                              <Input
+                                                value={step.memo}
+                                                onChange={(v) =>
+                                                  updateStep(selectedProject.id, phase.id, step.id, { memo: v })
+                                                }
+                                                placeholder="마감 메모"
+                                              />
+                                            </div>
+
+                                            <button
+                                              onClick={() =>
+                                                updateStep(selectedProject.id, phase.id, step.id, {
+                                                  dueDate: "",
+                                                  confirmedAt: "",
+                                                  memo: "",
+                                                  assigneeMemberId: "",
+                                                  dueReminderSentMap: {},
+                                                })
+                                              }
+                                              className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700"
+                                            >
+                                              초기화
+                                            </button>
+                                          </div>
+
+                                          <div className="mt-3 max-w-full xl:max-w-[320px]">
+                                            <div className="rounded-xl border border-[#c8d5ff] bg-[#f5f8ff] px-3 py-2.5">
+                                              <div className="mb-1 text-[10px] uppercase tracking-[0.14em] text-neutral-500">
+                                                Assignee
+                                              </div>
+                                              <select
+                                                value={assigneeMember ? step.assigneeMemberId : ""}
+                                                onChange={(e) =>
+                                                  updateStep(selectedProject.id, phase.id, step.id, {
+                                                    assigneeMemberId: e.target.value,
+                                                  })
+                                                }
+                                                className="w-full cursor-pointer bg-transparent text-[14px] text-neutral-900 outline-none"
+                                              >
+                                                <option value="">미지정</option>
+                                                {globalMembers.map((member) => (
+                                                  <option key={member.id} value={member.id}>
+                                                    {member.name}
+                                                  </option>
+                                                ))}
+                                              </select>
+                                              {assigneeMember ? (
+                                                <div className="mt-1.5 truncate text-[11px] text-neutral-500">
+                                                  {assigneeMember.email}
+                                                </div>
+                                              ) : null}
+                                            </div>
+                                          </div>
+
+                                          <div className="mt-4 rounded-2xl border border-neutral-200 bg-[#faf9f7] p-3">
+                                            <div className="mb-2 flex items-center justify-between">
+                                              <div className="text-[11px] uppercase tracking-[0.14em] text-neutral-500">
+                                                Comments / Mentions
+                                              </div>
+                                              <button
+                                                onClick={() => toggleCommentOpen(step.id)}
+                                                className="rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium"
+                                              >
+                                                {commentOpenMap[step.id] ? "Hide" : "Open"}
+                                              </button>
+                                            </div>
+
+                                            {commentOpenMap[step.id] && (
+                                              <div className="relative">
+                                                <div className="rounded-xl border border-neutral-200 bg-white px-3 py-2">
+                                                  <textarea
+                                                    value={commentDraft}
+                                                    onChange={(e) => setCommentDraft(step.id, e.target.value)}
+                                                    placeholder="@김성경 확인 부탁 / @name 으로 멘션"
+                                                    className="min-h-[88px] w-full resize-none bg-transparent text-sm outline-none placeholder:text-neutral-400"
+                                                  />
+                                                </div>
+
+                                                {mentionQuery !== null && mentionCandidates.length > 0 && (
+                                                  <div className="absolute left-0 top-full z-10 mt-2 w-full rounded-2xl border border-neutral-200 bg-white p-2 shadow-lg">
+                                                    {mentionCandidates.map((member) => (
+                                                      <button
+                                                        key={member.id}
+                                                        onClick={() => applyMention(step.id, member)}
+                                                        className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left hover:bg-neutral-50"
+                                                      >
+                                                        <MemberInitial name={member.name} />
+                                                        <div className="min-w-0">
+                                                          <div className="truncate text-sm font-medium">{member.name}</div>
+                                                          <div className="truncate text-xs text-neutral-500">{member.email}</div>
+                                                        </div>
+                                                      </button>
+                                                    ))}
+                                                  </div>
+                                                )}
+
+                                                <div className="mt-2 flex justify-end">
+                                                  <button
+                                                    type="button"
+                                                    disabled={savingCommentStepId === step.id}
+                                                    onClick={() => {
+                                                      void addCommentWithMentions(selectedProject.id, phase.id, step.id);
+                                                    }}
+                                                    className="rounded-xl border border-slate-900 bg-slate-900 px-3 py-2 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+                                                  >
+                                                    {savingCommentStepId === step.id ? "저장 중…" : "Save Comment"}
+                                                  </button>
+                                                </div>
+                                              </div>
+                                            )}
+
+                                            <div className="mt-3 space-y-2">
+                                              {step.comments.length === 0 ? (
+                                                <div className="text-sm text-neutral-400">아직 댓글이 없습니다.</div>
+                                              ) : (
+                                                step.comments.map((comment) => (
+                                                  <div
+                                                    key={comment.id}
+                                                    className="rounded-xl border border-neutral-200 bg-white px-3 py-3"
+                                                  >
+                                                    <div className="flex items-center justify-between gap-3">
+                                                      <div className="text-sm font-semibold">{comment.authorName}</div>
+                                                      <div className="text-xs text-neutral-400">{comment.createdAt}</div>
+                                                    </div>
+                                                    <div className="mt-2 text-sm leading-6 text-neutral-700">
+                                                      {renderMentions(comment.message, comment.mentions)}
+                                                    </div>
+                                                  </div>
+                                                ))
+                                              )}
+                                            </div>
+                                          </div>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+                </div>
+
+                <aside className="space-y-4 2xl:sticky 2xl:top-4 2xl:self-start">
+                  <section className="rounded-[26px] border border-neutral-200 bg-white p-4">
+                    <div className="mb-3">
+                      <div className="mb-1 text-[11px] uppercase tracking-[0.22em] text-neutral-500">Update Log</div>
+                      <h2 className="text-[20px] font-bold tracking-[-0.03em]">Email Log</h2>
+                    </div>
+
+                    <div className="space-y-3">
+                      {selectedProject.notificationLogs.length === 0 ? (
+                        <div className="rounded-2xl border border-dashed border-neutral-200 bg-[#faf9f7] px-4 py-6 text-center text-sm text-neutral-400">
+                          아직 이메일 알림 로그가 없습니다.
+                        </div>
+                      ) : (
+                        selectedProject.notificationLogs.map((log) => (
+                          <div key={log.id} className="rounded-2xl border border-neutral-200 bg-[#faf9f7] px-3 py-3">
+                            <div className="text-sm font-semibold">{log.stepLabel}</div>
+                            <div className="mt-1 text-xs text-neutral-500">{log.phaseTitle}</div>
+                            <div className="mt-2 text-xs text-neutral-600">
+                              {log.kind === "due_reminder" ? (
+                                <>
+                                  <span className="font-medium">{log.authorName}</span>
+                                  {log.recipients.length > 0
+                                    ? ` → ${log.recipients.map((r) => `${r.name} (${r.email})`).join(", ")}`
+                                    : null}
+                                </>
+                              ) : (
+                                <>
+                                  <span className="font-medium">{log.authorName}</span> mentioned{" "}
+                                  {log.recipients.map((r) => `@${r.name}`).join(", ")}
+                                </>
+                              )}
+                            </div>
+                            <div className="mt-2 text-sm text-neutral-700">{log.commentText}</div>
+                            <div className="mt-2 text-xs text-neutral-400">{log.createdAt}</div>
+                            {log.emailNotify && (
+                              <div className="mt-2 border-t border-neutral-200 pt-2 text-[11px] leading-relaxed text-neutral-600">
+                                <div
+                                  className={
+                                    log.emailNotify.overallOk ? "font-medium text-emerald-700" : "font-medium text-rose-700"
+                                  }
+                                >
+                                  이메일:{" "}
+                                  {log.emailNotify.mock ? "[MOCK] " : ""}
+                                  {log.emailNotify.overallOk ? "발송 성공" : "발송 실패"}
+                                  {log.emailNotify.attemptedAt ? ` · ${log.emailNotify.attemptedAt}` : ""}
+                                </div>
+                                {log.emailNotify.overallError ? (
+                                  <div className="mt-1 text-rose-600">{log.emailNotify.overallError}</div>
+                                ) : null}
+                                {log.emailNotify.perRecipient.some((r) => !r.ok) ? (
+                                  <ul className="mt-1 list-inside list-disc text-neutral-500">
+                                    {log.emailNotify.perRecipient
+                                      .filter((r) => !r.ok)
+                                      .map((r) => (
+                                        <li key={r.email}>
+                                          {r.name} ({r.email}){r.error ? ` — ${r.error}` : ""}
+                                        </li>
+                                      ))}
+                                  </ul>
+                                ) : null}
+                              </div>
+                            )}
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </section>
+                </aside>
+              </div>
+            </>
+          ) : (
+            <div className="rounded-[26px] border border-neutral-200 bg-white px-6 py-16 text-center">
+              <div className="text-[22px] font-bold">프로젝트가 없습니다.</div>
+              <div className="mt-2 text-sm text-neutral-500">왼쪽에서 New Project로 시작하면 됩니다.</div>
+            </div>
+          )}
+        </main>
+      </div>
+    </div>
+  );
+}

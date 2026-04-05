@@ -1,0 +1,301 @@
+                <div className="flex flex-col gap-4">
+                  <section className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                    <div className="rounded-[22px] border border-neutral-200 bg-white p-4">
+                      <div className="text-[11px] uppercase tracking-[0.18em] text-neutral-500">Progress</div>
+                      <div className="mt-2 text-[26px] font-black">
+                        {selectedProgress.done}/{selectedProgress.total}
+                      </div>
+                      <div className="mt-3 h-2.5 rounded-full bg-neutral-200">
+                        <div className="h-2.5 rounded-full bg-slate-900" style={{ width: `${selectedProgress.percent}%` }} />
+                      </div>
+                    </div>
+
+                    <div className="rounded-[22px] border border-neutral-200 bg-white p-4">
+                      <div className="text-[11px] uppercase tracking-[0.18em] text-neutral-500">Next Due</div>
+                      {selectedNextDue ? (
+                        <>
+                          <div className="mt-2 text-[15px] font-bold">{selectedNextDue.label}</div>
+                          <div className="mt-1 text-sm text-neutral-500">{selectedNextDue.dueDate.replace("T", " ")}</div>
+                          <div className="mt-1 text-xs text-neutral-400">{selectedNextDue.phaseTitle}</div>
+                        </>
+                      ) : (
+                        <div className="mt-2 text-sm text-neutral-500">No due scheduled</div>
+                      )}
+                    </div>
+
+                    <div className="rounded-[22px] border border-neutral-200 bg-white p-4">
+                      <div className="text-[11px] uppercase tracking-[0.18em] text-neutral-500">Overdue</div>
+                      <div className={`mt-2 text-[26px] font-black ${selectedOverdueCount > 0 ? "text-rose-600" : "text-neutral-900"}`}>
+                        {selectedOverdueCount}
+                      </div>
+                      <div className="mt-1 text-sm text-neutral-500">unchecked steps</div>
+                    </div>
+                  </section>
+
+                  <section className="rounded-[26px] border border-neutral-200 bg-white p-5">
+                    <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+                      <div>
+                        <div className="mb-1 text-[11px] uppercase tracking-[0.22em] text-neutral-500">Flowchart</div>
+                        <h2 className="text-[22px] font-bold tracking-[-0.03em]">15-Step Checklist</h2>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={dueReminderBusy}
+                        onClick={() => {
+                          void runDueReminderScan();
+                        }}
+                        className="shrink-0 rounded-xl border border-neutral-200 bg-[#f8f7f5] px-3 py-2 text-xs font-medium text-neutral-700 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {dueReminderBusy ? "Due 알림 검사 중…" : "Due 24h 알림 검사 (API)"}
+                      </button>
+                    </div>
+
+                    <div className="space-y-3">
+                      {selectedProject.phases.map((phase) => {
+                        const doneCount = phase.steps.filter((step) => step.checked).length;
+                        const phaseOverdueCount = getPhaseOverdueCount(phase);
+
+                        return (
+                          <div key={phase.id} className="overflow-hidden rounded-[22px] border border-neutral-200">
+                            <button
+                              onClick={() => togglePhase(selectedProject.id, phase.id)}
+                              className="flex w-full items-start justify-between gap-4 border-b border-neutral-200 bg-[#f8f7f5] px-4 py-4 text-left"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <div className="text-[18px] font-bold tracking-[-0.02em]">{phase.title}</div>
+                                  {phaseOverdueCount > 0 && (
+                                    <span className="rounded-full bg-rose-50 px-2 py-1 text-[11px] font-semibold text-rose-700">
+                                      {phaseOverdueCount} overdue
+                                    </span>
+                                  )}
+                                </div>
+
+                                <div className="mt-1 text-xs text-neutral-500">
+                                  {doneCount}/{phase.steps.length} done
+                                </div>
+
+                                {!phase.expanded && (
+                                  <div className="mt-2 text-sm leading-6 text-neutral-500">
+                                    {phase.steps.map((step) => step.label).join(" · ")}
+                                  </div>
+                                )}
+                              </div>
+
+                              <div className="pt-1 text-xl text-neutral-500">{phase.expanded ? "−" : "+"}</div>
+                            </button>
+
+                            {phase.expanded && (
+                              <div className="space-y-4 px-4 py-4">
+                                {phase.steps.map((step) => {
+                                  const overdue = !step.checked && !!step.dueDate && isOverdue(step.dueDate);
+                                  const assigneeMember = globalMembers.find((m) => m.id === step.assigneeMemberId);
+                                  const commentDraft = commentDrafts[step.id] ?? "";
+                                  const mentionQuery = extractMentionQuery(commentDraft);
+                                  const mentionCandidates =
+                                    mentionQuery !== null
+                                      ? globalMembers.filter(
+                                          (member) =>
+                                            member.name.toLowerCase().includes(mentionQuery.toLowerCase()) ||
+                                            member.email.toLowerCase().includes(mentionQuery.toLowerCase())
+                                        )
+                                      : [];
+
+                                  return (
+                                    <div key={step.id} className="rounded-[20px] border border-neutral-200 bg-white px-4 py-4">
+                                      <div className="flex items-start gap-3">
+                                        <input
+                                          type="checkbox"
+                                          checked={step.checked}
+                                          onChange={(e) =>
+                                            toggleStepChecked(selectedProject.id, phase.id, step.id, e.target.checked)
+                                          }
+                                          className="mt-1 h-4 w-4 shrink-0 accent-blue-600"
+                                        />
+
+                                        <div className="min-w-0 flex-1">
+                                          <div className="text-[16px] font-medium text-neutral-900">{step.label}</div>
+
+                                          {overdue && (
+                                            <div className="mt-2 inline-flex rounded-full border border-rose-200 bg-rose-50 px-2 py-1 text-[11px] font-medium text-rose-700">
+                                              OVERDUE
+                                            </div>
+                                          )}
+
+                                          <div className="mt-3 grid grid-cols-1 gap-3 xl:grid-cols-[240px_240px_minmax(0,1fr)_110px]">
+                                            <div className="rounded-xl border border-[#c8d5ff] bg-[#f5f8ff] px-3 py-2.5">
+                                              <div className="mb-1 text-[10px] uppercase tracking-[0.14em] text-neutral-500">
+                                                Due Date
+                                              </div>
+                                              <Input
+                                                type="datetime-local"
+                                                value={step.dueDate}
+                                                onChange={(v) =>
+                                                  updateStep(selectedProject.id, phase.id, step.id, { dueDate: v })
+                                                }
+                                              />
+                                            </div>
+
+                                            <div className="rounded-xl border border-neutral-200 bg-white px-3 py-2.5">
+                                              <div className="mb-1 text-[10px] uppercase tracking-[0.14em] text-neutral-500">
+                                                Confirmed At
+                                              </div>
+                                              <Input
+                                                type="datetime-local"
+                                                value={step.confirmedAt}
+                                                onChange={(v) =>
+                                                  updateStep(selectedProject.id, phase.id, step.id, { confirmedAt: v })
+                                                }
+                                              />
+                                            </div>
+
+                                            <div className="rounded-xl border border-[#c8d5ff] bg-[#f5f8ff] px-3 py-2.5">
+                                              <div className="mb-1 text-[10px] uppercase tracking-[0.14em] text-neutral-500">
+                                                Remark
+                                              </div>
+                                              <Input
+                                                value={step.memo}
+                                                onChange={(v) =>
+                                                  updateStep(selectedProject.id, phase.id, step.id, { memo: v })
+                                                }
+                                                placeholder="마감 메모"
+                                              />
+                                            </div>
+
+                                            <button
+                                              onClick={() =>
+                                                updateStep(selectedProject.id, phase.id, step.id, {
+                                                  dueDate: "",
+                                                  confirmedAt: "",
+                                                  memo: "",
+                                                  assigneeMemberId: "",
+                                                  dueReminderSentAt: "",
+                                                })
+                                              }
+                                              className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700"
+                                            >
+                                              초기화
+                                            </button>
+                                          </div>
+
+                                          <div className="mt-3 max-w-full xl:max-w-[320px]">
+                                            <div className="rounded-xl border border-[#c8d5ff] bg-[#f5f8ff] px-3 py-2.5">
+                                              <div className="mb-1 text-[10px] uppercase tracking-[0.14em] text-neutral-500">
+                                                Assignee
+                                              </div>
+                                              <select
+                                                value={assigneeMember ? step.assigneeMemberId : ""}
+                                                onChange={(e) =>
+                                                  updateStep(selectedProject.id, phase.id, step.id, {
+                                                    assigneeMemberId: e.target.value,
+                                                  })
+                                                }
+                                                className="w-full cursor-pointer bg-transparent text-[14px] text-neutral-900 outline-none"
+                                              >
+                                                <option value="">미지정</option>
+                                                {globalMembers.map((member) => (
+                                                  <option key={member.id} value={member.id}>
+                                                    {member.name}
+                                                  </option>
+                                                ))}
+                                              </select>
+                                              {assigneeMember ? (
+                                                <div className="mt-1.5 truncate text-[11px] text-neutral-500">
+                                                  {assigneeMember.email}
+                                                </div>
+                                              ) : null}
+                                            </div>
+                                          </div>
+
+                                          <div className="mt-4 rounded-2xl border border-neutral-200 bg-[#faf9f7] p-3">
+                                            <div className="mb-2 flex items-center justify-between">
+                                              <div className="text-[11px] uppercase tracking-[0.14em] text-neutral-500">
+                                                Comments / Mentions
+                                              </div>
+                                              <button
+                                                onClick={() => toggleCommentOpen(step.id)}
+                                                className="rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-xs font-medium"
+                                              >
+                                                {commentOpenMap[step.id] ? "Hide" : "Open"}
+                                              </button>
+                                            </div>
+
+                                            {commentOpenMap[step.id] && (
+                                              <div className="relative">
+                                                <div className="rounded-xl border border-neutral-200 bg-white px-3 py-2">
+                                                  <textarea
+                                                    value={commentDraft}
+                                                    onChange={(e) => setCommentDraft(step.id, e.target.value)}
+                                                    placeholder="@김성경 확인 부탁 / @name 으로 멘션"
+                                                    className="min-h-[88px] w-full resize-none bg-transparent text-sm outline-none placeholder:text-neutral-400"
+                                                  />
+                                                </div>
+
+                                                {mentionQuery !== null && mentionCandidates.length > 0 && (
+                                                  <div className="absolute left-0 top-full z-10 mt-2 w-full rounded-2xl border border-neutral-200 bg-white p-2 shadow-lg">
+                                                    {mentionCandidates.map((member) => (
+                                                      <button
+                                                        key={member.id}
+                                                        onClick={() => applyMention(step.id, member)}
+                                                        className="flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left hover:bg-neutral-50"
+                                                      >
+                                                        <MemberInitial name={member.name} />
+                                                        <div className="min-w-0">
+                                                          <div className="truncate text-sm font-medium">{member.name}</div>
+                                                          <div className="truncate text-xs text-neutral-500">{member.email}</div>
+                                                        </div>
+                                                      </button>
+                                                    ))}
+                                                  </div>
+                                                )}
+
+                                                <div className="mt-2 flex justify-end">
+                                                  <button
+                                                    type="button"
+                                                    disabled={savingCommentStepId === step.id}
+                                                    onClick={() => {
+                                                      void addCommentWithMentions(selectedProject.id, phase.id, step.id);
+                                                    }}
+                                                    className="rounded-xl border border-slate-900 bg-slate-900 px-3 py-2 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+                                                  >
+                                                    {savingCommentStepId === step.id ? "저장 중…" : "Save Comment"}
+                                                  </button>
+                                                </div>
+                                              </div>
+                                            )}
+
+                                            <div className="mt-3 space-y-2">
+                                              {step.comments.length === 0 ? (
+                                                <div className="text-sm text-neutral-400">아직 댓글이 없습니다.</div>
+                                              ) : (
+                                                step.comments.map((comment) => (
+                                                  <div
+                                                    key={comment.id}
+                                                    className="rounded-xl border border-neutral-200 bg-white px-3 py-3"
+                                                  >
+                                                    <div className="flex items-center justify-between gap-3">
+                                                      <div className="text-sm font-semibold">{comment.authorName}</div>
+                                                      <div className="text-xs text-neutral-400">{comment.createdAt}</div>
+                                                    </div>
+                                                    <div className="mt-2 text-sm leading-6 text-neutral-700">
+                                                      {renderMentions(comment.message, comment.mentions)}
+                                                    </div>
+                                                  </div>
+                                                ))
+                                              )}
+                                            </div>
+                                          </div>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </section>
+                </div>
+
